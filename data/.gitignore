@@ -1,0 +1,5 @@
+# Защита данных Zeta
+*.db
+*.log
+*.cache
+avatar/*
