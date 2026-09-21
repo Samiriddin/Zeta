@@ -1,8 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-Окно режима программиста Zeta.
-Поддерживает: чат с кодом, дерево проекта, редактор кода, консоль, терминал,
-Git-граф, авто-коммит, автодополнение, линтер, запуск файлов.
+Окно режима разработчика Zeta — ПОЛНОЦЕННАЯ IDE.
+Поддерживает: чат с ИИ, дерево проекта, редактор кода с нумерацией строк,
+консоль, терминал, Git-граф, авто-коммит, автодополнение, линтер, запуск файлов,
+поиск по проекту, установку пакетов, быстрые команды, авто-сохранение.
+
+ИСПРАВЛЕНО (2026-09-21):
+    - QShortcut перенесён из QtWidgets в QtGui (ImportError fix)
+    - Переименовано: "Режим программиста" → "Режим разработчика"
+    - Добавлена нумерация строк в редакторе
+    - Добавлены горячие клавиши: Ctrl+S, Ctrl+R, Ctrl+B, Ctrl+Tab
+    - Улучшен линтер: python -m py_compile (точные ошибки)
+    - Авто-сохранение каждые 30 сек
+    - Контекстное меню в дереве файлов
+    - Поиск по файлам проекта
+    - Вкладка "Логи" (data/zeta.log)
+    - Быстрые команды: start_zeta.bat, start_web.bat, start_all.bat
+    - Установка pip-пакетов через UI
+    - Индикатор позиции курсора в статус-баре
+    - Стиль VS Code / Monaco
 """
 
 import os
@@ -10,6 +26,7 @@ import subprocess
 import re
 import ast
 import sys
+import time
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -19,148 +36,298 @@ from PyQt6.QtWidgets import (
     QListWidget, QSplitter, QTreeWidget, QTreeWidgetItem,
     QProgressBar, QMessageBox, QMenu, QApplication,
     QFileDialog, QPlainTextEdit, QStatusBar, QTextBrowser,
-    QScrollArea, QTabWidget, QInputDialog
+    QScrollArea, QTabWidget, QInputDialog, QCheckBox,
+    QComboBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QProcess
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QProcess, QRect, QSize
 from PyQt6.QtGui import (
     QTextCursor, QTextCharFormat, QColor, QFont, QAction,
-    QSyntaxHighlighter, QTextFormat, QPainter, QKeySequence
+    QSyntaxHighlighter, QTextFormat, QPainter, QKeySequence,
+    QFontDatabase, QPalette, QPixmap, QIcon,
+    QShortcut
 )
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.ai_engine import ask_zeta
 from core.memory import get_setting, save_setting
 from voice.tts import speak
-from modules.project_context import scan_project, get_file_tree, get_current_project_path
+from modules.vscode_context import scan_project, get_file_tree, get_current_project_path
 
-# ========== ТЕМЫ ==========
+
+# ========== ТЕМА VS CODE (Monaco-inspired) ==========
 THEMES = {
     "dark": {
-        "frame_bg": "#1e1e2e",
-        "frame_border": "#313244",
-        "text": "#cdd6f4",
-        "chat_bg": "#181825",
-        "input_bg": "#313244",
-        "accent": "#89b4fa",
-        "accent_hover": "#74c7ec",
-        "accent_text": "#1e1e2e",
-        "close_bg": "#f38ba8",
+        "frame_bg": "#1e1e1e",
+        "frame_border": "#2d2d30",
+        "text": "#d4d4d4",
+        "text_dim": "#808080",
+        "chat_bg": "#252526",
+        "input_bg": "#3c3c3c",
+        "accent": "#007acc",
+        "accent_hover": "#1a8ad4",
+        "accent_text": "#ffffff",
+        "close_bg": "#f48771",
         "close_hover": "#e06c75",
-        "success": "#a6e3a1",
-        "warning": "#f9e2af",
-        "danger": "#f38ba8",
-        "info": "#89b4fa",
-        "code_bg": "#1e1e2e",
-        "console_bg": "#1e1e2e",
+        "success": "#4ec9b0",
+        "warning": "#dcdcaa",
+        "danger": "#f48771",
+        "info": "#569cd6",
+        "code_bg": "#1e1e1e",
+        "console_bg": "#1e1e1e",
+        "gutter_bg": "#252526",
+        "gutter_text": "#858585",
+        "line_highlight": "#2a2d2e",
+        "sidebar_bg": "#252526",
+        "activitybar_bg": "#333333",
+        "statusbar_bg": "#007acc",
+        "statusbar_text": "#ffffff",
     },
     "light": {
-        "frame_bg": "#eff1f5",
-        "frame_border": "#ccd0da",
-        "text": "#4c4f69",
-        "chat_bg": "#e6e9ef",
-        "input_bg": "#dce0e8",
-        "accent": "#1e66f5",
-        "accent_hover": "#04a5e5",
-        "accent_text": "#eff1f5",
+        "frame_bg": "#ffffff",
+        "frame_border": "#e0e0e0",
+        "text": "#333333",
+        "text_dim": "#808080",
+        "chat_bg": "#f3f3f3",
+        "input_bg": "#e8e8e8",
+        "accent": "#007acc",
+        "accent_hover": "#1a8ad4",
+        "accent_text": "#ffffff",
         "close_bg": "#d20f39",
         "close_hover": "#e64553",
         "success": "#40a02b",
         "warning": "#df8e1d",
         "danger": "#d20f39",
         "info": "#1e66f5",
-        "code_bg": "#e0e0e0",
-        "console_bg": "#f0f0f0",
-    },
-}
-
-# ========== ЦВЕТА ПОДСВЕТКИ ==========
-SYNTAX_COLORS = {
-    "python": {
-        "keyword": "#c678dd",
-        "string": "#98c379",
-        "comment": "#5c6370",
-        "function": "#61afef",
-        "number": "#d19a66",
-    },
-    "javascript": {
-        "keyword": "#c678dd",
-        "string": "#98c379",
-        "comment": "#5c6370",
-        "function": "#61afef",
-        "number": "#d19a66",
-    },
-    "html": {
-        "tag": "#e06c75",
-        "attribute": "#d19a66",
-        "string": "#98c379",
-    },
-    "css": {
-        "property": "#c678dd",
-        "value": "#98c379",
-        "selector": "#61afef",
+        "code_bg": "#ffffff",
+        "console_bg": "#f5f5f5",
+        "gutter_bg": "#f0f0f0",
+        "gutter_text": "#999999",
+        "line_highlight": "#f0f0f0",
+        "sidebar_bg": "#f3f3f3",
+        "activitybar_bg": "#e0e0e0",
+        "statusbar_bg": "#007acc",
+        "statusbar_text": "#ffffff",
     },
 }
 
 
-# ========== ПОДСВЕТКА СИНТАКСИСА (PYQT) ==========
+# ========== ПОДСВЕТКА СИНТАКСИСА ==========
 class PythonHighlighter(QSyntaxHighlighter):
-    """Подсветка синтаксиса Python для редактора кода."""
+    """Подсветка синтаксиса Python (стиль VS Code)."""
 
-    def __init__(self, document):
+    def __init__(self, document, theme):
         super().__init__(document)
+        self.theme = theme
+
         self.keyword_format = QTextCharFormat()
-        self.keyword_format.setForeground(QColor("#c678dd"))
+        self.keyword_format.setForeground(QColor("#c586c0"))
         self.keyword_format.setFontWeight(QFont.Weight.Bold)
 
+        self.builtin_format = QTextCharFormat()
+        self.builtin_format.setForeground(QColor("#4ec9b0"))
+
         self.string_format = QTextCharFormat()
-        self.string_format.setForeground(QColor("#98c379"))
+        self.string_format.setForeground(QColor("#ce9178"))
 
         self.comment_format = QTextCharFormat()
-        self.comment_format.setForeground(QColor("#5c6370"))
+        self.comment_format.setForeground(QColor("#6a9955"))
         self.comment_format.setFontItalic(True)
 
         self.function_format = QTextCharFormat()
-        self.function_format.setForeground(QColor("#61afef"))
+        self.function_format.setForeground(QColor("#dcdcaa"))
 
         self.number_format = QTextCharFormat()
-        self.number_format.setForeground(QColor("#d19a66"))
+        self.number_format.setForeground(QColor("#b5cea8"))
+
+        self.decorator_format = QTextCharFormat()
+        self.decorator_format.setForeground(QColor("#dcdcaa"))
+        self.decorator_format.setFontItalic(True)
 
         self.keywords = [
             "def", "class", "return", "if", "elif", "else", "for", "while",
             "import", "from", "try", "except", "finally", "with", "as", "pass",
             "break", "continue", "lambda", "yield", "global", "nonlocal",
-            "True", "False", "None", "async", "await", "in", "is", "not", "and", "or"
+            "True", "False", "None", "async", "await", "in", "is", "not",
+            "and", "or", "raise", "del", "assert", "match", "case"
+        ]
+
+        self.builtins = [
+            "print", "len", "range", "str", "int", "float", "list", "dict",
+            "set", "tuple", "type", "isinstance", "hasattr", "getattr",
+            "setattr", "open", "input", "int", "bool", "bytes", "sum",
+            "min", "max", "abs", "round", "sorted", "reversed", "enumerate",
+            "zip", "map", "filter", "any", "all", "repr", "eval", "exec"
         ]
 
     def highlightBlock(self, text):
-        # Комментарии
-        self.setCurrentBlockState(0)
-        comment_index = text.find("#")
+        in_string = None
+        comment_index = -1
+        i = 0
+        while i < len(text):
+            c = text[i]
+            if in_string:
+                if c == in_string:
+                    in_string = None
+            elif c in ('"', "'"):
+                in_string = c
+            elif c == "#":
+                comment_index = i
+                break
+            i += 1
+
         if comment_index >= 0:
             self.setFormat(comment_index, len(text) - comment_index, self.comment_format)
 
-        # Строки
         string_pattern = re.compile(r'(["\'])(.*?)\1')
         for match in string_pattern.finditer(text):
+            if comment_index >= 0 and match.start() > comment_index:
+                continue
             self.setFormat(match.start(), len(match.group()), self.string_format)
 
-        # Ключевые слова
+        decorator_pattern = re.compile(r'@\w+(\.\w+)*')
+        for match in decorator_pattern.finditer(text):
+            self.setFormat(match.start(), len(match.group()), self.decorator_format)
+
         for keyword in self.keywords:
             pattern = re.compile(rf'\b{keyword}\b')
             for match in pattern.finditer(text):
+                if comment_index >= 0 and match.start() > comment_index:
+                    continue
                 self.setFormat(match.start(), len(keyword), self.keyword_format)
 
-        # Числа
-        number_pattern = re.compile(r'\b\d+\b')
+        for builtin in self.builtins:
+            pattern = re.compile(rf'\b{builtin}\b')
+            for match in pattern.finditer(text):
+                if comment_index >= 0 and match.start() > comment_index:
+                    continue
+                self.setFormat(match.start(), len(builtin), self.builtin_format)
+
+        number_pattern = re.compile(r'\b\d+(\.\d+)?\b')
         for match in number_pattern.finditer(text):
+            if comment_index >= 0 and match.start() > comment_index:
+                continue
             self.setFormat(match.start(), len(match.group()), self.number_format)
 
-        # Функции
         func_pattern = re.compile(r'\b(\w+)(?=\s*\()')
         for match in func_pattern.finditer(text):
+            if comment_index >= 0 and match.start() > comment_index:
+                continue
             self.setFormat(match.start(), len(match.group(1)), self.function_format)
 
 
-# ========== ПОТОК ДЛЯ ОТВЕТОВ ==========
+# ========== РЕДАКТОР С НУМЕРАЦИЕЙ СТРОК ==========
+class LineNumberArea(QWidget):
+    """Область с номерами строк."""
+
+    def __init__(self, editor):
+        super().__init__(editor)
+        self.editor = editor
+
+    def sizeHint(self):
+        return QSize(self.editor.line_number_area_width(), 0)
+
+    def paintEvent(self, event):
+        self.editor.line_number_area_paint_event(event)
+
+
+class CodeEditor(QPlainTextEdit):
+    """Редактор кода с нумерацией строк и подсветкой текущей строки."""
+
+    def __init__(self, theme):
+        super().__init__()
+        self.theme = theme
+
+        font = QFont("Consolas", 11)
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        self.setFont(font)
+
+        self.line_number_area = LineNumberArea(self)
+
+        self.blockCountChanged.connect(self.update_line_number_area_width)
+        self.updateRequest.connect(self.update_line_number_area)
+        self.cursorPositionChanged.connect(self.highlight_current_line)
+
+        self.update_line_number_area_width(0)
+        self.highlight_current_line()
+
+        self.setTabStopDistance(4 * self.fontMetrics().horizontalAdvance(" "))
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+
+    def line_number_area_width(self) -> int:
+        digits = 1
+        max_num = max(1, self.blockCount())
+        while max_num >= 10:
+            max_num //= 10
+            digits += 1
+        space = 15 + self.fontMetrics().horizontalAdvance("9") * digits
+        return space
+
+    def update_line_number_area_width(self, _):
+        self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
+
+    def update_line_number_area(self, rect, dy):
+        if dy:
+            self.line_number_area.scroll(0, dy)
+        else:
+            self.line_number_area.update(
+                0, rect.y(), self.line_number_area.width(), rect.height()
+            )
+        if rect.contains(self.viewport().rect()):
+            self.update_line_number_area_width(0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        cr = self.contentsRect()
+        self.line_number_area.setGeometry(
+            QRect(cr.left(), cr.top(), self.line_number_area_width(), cr.height())
+        )
+
+    def line_number_area_paint_event(self, event):
+        painter = QPainter(self.line_number_area)
+        painter.fillRect(event.rect(), QColor(self.theme["gutter_bg"]))
+
+        block = self.firstVisibleBlock()
+        block_number = block.blockNumber()
+        top = self.blockBoundingGeometry(block).translated(self.contentOffset()).top()
+        bottom = top + self.blockBoundingRect(block).height()
+
+        painter.setPen(QColor(self.theme["gutter_text"]))
+        painter.setFont(self.font())
+
+        while block.isValid() and top <= event.rect().bottom():
+            if block.isVisible() and bottom >= event.rect().top():
+                number = str(block_number + 1)
+                painter.drawText(
+                    0, int(top),
+                    self.line_number_area.width() - 5,
+                    self.fontMetrics().height(),
+                    Qt.AlignmentFlag.AlignRight,
+                    number,
+                )
+            block = block.next()
+            top = bottom
+            bottom = top + self.blockBoundingRect(block).height()
+            block_number += 1
+
+    def highlight_current_line(self):
+        extra_selections = []
+
+        if not self.isReadOnly():
+            selection = QTextEdit.ExtraSelection()
+            line_color = QColor(self.theme["line_highlight"])
+            selection.format.setBackground(line_color)
+            selection.format.setProperty(
+                QTextFormat.Property.FullWidthSelection, True
+            )
+            selection.cursor = self.textCursor()
+            selection.cursor.clearSelection()
+            extra_selections.append(selection)
+
+        self.setExtraSelections(extra_selections)
+
+
+# ========== ПОТОКИ ==========
 class ProgWorker(QThread):
     chunk_ready = pyqtSignal(str)
     finished = pyqtSignal(str)
@@ -181,7 +348,6 @@ class ProgWorker(QThread):
             self.error.emit(f"⚠️ Ошибка: {str(e)}")
 
 
-# ========== ПОТОК ДЛЯ ВЫПОЛНЕНИЯ ==========
 class RunProcess(QThread):
     output_ready = pyqtSignal(str)
     finished_process = pyqtSignal(int)
@@ -196,22 +362,21 @@ class RunProcess(QThread):
             process = QProcess()
             process.setWorkingDirectory(self.cwd or os.getcwd())
             process.start("cmd", ["/c", self.command])
-            process.waitForFinished()
-            
+            process.waitForFinished(60000)
+
             output = process.readAllStandardOutput().data().decode('utf-8', errors='replace')
             error = process.readAllStandardError().data().decode('utf-8', errors='replace')
-            
+
             if output:
                 self.output_ready.emit(output)
             if error:
                 self.output_ready.emit(f"⚠️ Ошибка: {error}")
-            
+
             self.finished_process.emit(process.exitCode())
         except Exception as e:
             self.output_ready.emit(f"⚠️ Ошибка: {e}")
 
 
-# ========== ПОТОК ДЛЯ АВТОДОПОЛНЕНИЯ ==========
 class AutoCompleteWorker(QThread):
     result_ready = pyqtSignal(str)
 
@@ -223,18 +388,19 @@ class AutoCompleteWorker(QThread):
     def run(self):
         try:
             prompt = (
-                "Продолжи этот код. Верни только код, без объяснений.\n\n"
-                f"Текущий код:\n```python\n{self.code}\n```"
+                "Продолжи этот код. Верни ТОЛЬКО код, без объяснений, без ```.\n\n"
+                f"Текущий код:\n{self.code}\n\nПродолжение:"
             )
             result = ask_zeta(prompt, mode="programmer")
+            result = re.sub(r"```\w*\n?", "", result)
             self.result_ready.emit(result)
         except Exception as e:
-            self.result_ready.emit(f"⚠️ Ошибка: {e}")
+            self.result_ready.emit(f"# ⚠️ Ошибка: {e}")
 
 
 # ========== ГЛАВНОЕ ОКНО ==========
 class ProgrammerWindow(QWidget):
-    """Окно режима программиста Zeta."""
+    """Окно режима разработчика Zeta — полноценная IDE."""
 
     def __init__(self, theme_name: str = "dark"):
         super().__init__()
@@ -245,11 +411,12 @@ class ProgrammerWindow(QWidget):
         self.auto_complete_worker: Optional[AutoCompleteWorker] = None
         self._z_block_start = None
         self.project_path = get_current_project_path() or "D:\\Zeta"
-        self.file_tree_items: Dict[str, QTreeWidgetItem] = {}
         self.current_file_path = None
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.timeout.connect(self._auto_save)
 
-        self.setWindowTitle("💻 Z — Режим программиста")
-        self.setGeometry(100, 80, 1400, 850)
+        self.setWindowTitle("💻 Z — Режим разработчика")
+        self.setGeometry(60, 60, 1500, 900)
         self.setWindowFlags(
             Qt.WindowType.Window |
             Qt.WindowType.WindowStaysOnTopHint |
@@ -260,147 +427,162 @@ class ProgrammerWindow(QWidget):
         self.setStyleSheet(f"background-color: {self.theme['frame_bg']}; color: {self.theme['text']};")
 
         self.init_ui()
+        self.setup_hotkeys()
         self.load_project_tree()
         self.greet()
+
+        self._autosave_timer.start(30000)
 
     # ========== UI ==========
 
     def init_ui(self):
-        """Создаёт интерфейс."""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        # Верхняя панель инструментов
         toolbar = QHBoxLayout()
         toolbar.setSpacing(6)
 
-        self.btn_save = QPushButton("💾 Сохранить")
-        self.btn_save.setFixedSize(100, 30)
-        self.btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_save.setStyleSheet(self._btn_style())
-        self.btn_save.clicked.connect(self.save_current_file)
-        toolbar.addWidget(self.btn_save)
+        btn_save = self._make_toolbar_btn("💾 Сохранить", "Сохранить файл (Ctrl+S)", self.save_current_file)
+        toolbar.addWidget(btn_save)
 
-        self.btn_run = QPushButton("▶️ Запустить")
-        self.btn_run.setFixedSize(100, 30)
-        self.btn_run.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_run.setStyleSheet(self._btn_style())
-        self.btn_run.clicked.connect(self.run_current_file)
-        toolbar.addWidget(self.btn_run)
+        btn_run = self._make_toolbar_btn("▶️ Запустить", "Запустить файл (Ctrl+R)", self.run_current_file)
+        toolbar.addWidget(btn_run)
 
-        self.btn_open = QPushButton("📂 Открыть файл")
-        self.btn_open.setFixedSize(120, 30)
-        self.btn_open.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_open.setStyleSheet(self._btn_style())
-        self.btn_open.clicked.connect(self.open_file_dialog)
-        toolbar.addWidget(self.btn_open)
+        btn_open = self._make_toolbar_btn("📂 Открыть", "Открыть файл", self.open_file_dialog)
+        toolbar.addWidget(btn_open)
 
-        self.btn_vscode = QPushButton("🧩 Открыть в VS Code")
-        self.btn_vscode.setFixedSize(140, 30)
-        self.btn_vscode.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_vscode.setStyleSheet(self._btn_style())
-        self.btn_vscode.clicked.connect(self.open_in_vscode)
-        toolbar.addWidget(self.btn_vscode)
+        btn_vscode = self._make_toolbar_btn("🧩 VS Code", "Открыть в VS Code", self.open_in_vscode)
+        toolbar.addWidget(btn_vscode)
 
-        self.btn_lint = QPushButton("🔍 Проверить код")
-        self.btn_lint.setFixedSize(120, 30)
-        self.btn_lint.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_lint.setStyleSheet(self._btn_style())
-        self.btn_lint.clicked.connect(self.lint_code)
-        toolbar.addWidget(self.btn_lint)
+        btn_lint = self._make_toolbar_btn("🔍 Проверить", "Проверить код (Ctrl+B)", self.lint_code)
+        toolbar.addWidget(btn_lint)
+
+        btn_lint_all = self._make_toolbar_btn("🧪 Весь проект", "Проверить весь проект", self.lint_project)
+        toolbar.addWidget(btn_lint_all)
 
         toolbar.addStretch()
 
-        self.btn_auto_commit = QPushButton("🤖 Авто-коммит")
-        self.btn_auto_commit.setFixedSize(120, 30)
-        self.btn_auto_commit.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_auto_commit.setStyleSheet(self._btn_style())
-        self.btn_auto_commit.clicked.connect(self.auto_commit)
-        toolbar.addWidget(self.btn_auto_commit)
+        btn_auto_commit = self._make_toolbar_btn("🤖 Авто-коммит", "Git auto-commit", self.auto_commit)
+        toolbar.addWidget(btn_auto_commit)
 
-        self.btn_clear_chat = QPushButton("🗑️ Очистить чат")
-        self.btn_clear_chat.setFixedSize(120, 30)
-        self.btn_clear_chat.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_clear_chat.setStyleSheet(self._btn_style())
-        self.btn_clear_chat.clicked.connect(self.clear_chat)
-        toolbar.addWidget(self.btn_clear_chat)
+        btn_clear_chat = self._make_toolbar_btn("🗑️ Чат", "Очистить чат", self.clear_chat)
+        toolbar.addWidget(btn_clear_chat)
 
-        self.btn_clear_console = QPushButton("🧹 Очистить консоль")
-        self.btn_clear_console.setFixedSize(130, 30)
-        self.btn_clear_console.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_clear_console.setStyleSheet(self._btn_style())
-        self.btn_clear_console.clicked.connect(self.clear_console)
-        toolbar.addWidget(self.btn_clear_console)
+        btn_clear_console = self._make_toolbar_btn("🧹 Консоль", "Очистить консоль", self.clear_console)
+        toolbar.addWidget(btn_clear_console)
 
         layout.addLayout(toolbar)
 
-        # Основной сплиттер
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # ===== ЛЕВАЯ ПАНЕЛЬ: Дерево проекта =====
-        left_frame = self._create_left_panel()
-        splitter.addWidget(left_frame)
+        splitter.addWidget(self._create_left_panel())
+        splitter.addWidget(self._create_center_panel())
+        splitter.addWidget(self._create_right_panel())
 
-        # ===== ЦЕНТР: Чат + Редактор + Консоль + Терминал =====
-        center_frame = self._create_center_panel()
-        splitter.addWidget(center_frame)
-
-        # ===== ПРАВАЯ ПАНЕЛЬ: Инструменты и Git =====
-        right_frame = self._create_right_panel()
-        splitter.addWidget(right_frame)
-
-        splitter.setSizes([250, 550, 250])
+        splitter.setSizes([260, 700, 280])
         layout.addWidget(splitter)
 
-        # Статус-бар
         self.status_bar = QStatusBar()
-        self.status_bar.setStyleSheet(f"background-color: {self.theme['frame_bg']}; color: {self.theme['text']};")
+        self.status_bar.setStyleSheet(f"""
+            QStatusBar {{
+                background-color: {self.theme['statusbar_bg']};
+                color: {self.theme['statusbar_text']};
+                font-size: 11px;
+                padding: 2px;
+            }}
+        """)
         self.status_bar.showMessage("✅ Готов")
+
+        self.cursor_pos_label = QLabel("Стр 1, Кол 1")
+        self.cursor_pos_label.setStyleSheet(f"color: {self.theme['statusbar_text']}; padding-right: 10px;")
+        self.status_bar.addPermanentWidget(self.cursor_pos_label)
+
+        self.lint_status = QLabel("")
+        self.lint_status.setStyleSheet(f"color: {self.theme['statusbar_text']}; padding-right: 10px;")
+        self.status_bar.addPermanentWidget(self.lint_status)
+
         layout.addWidget(self.status_bar)
 
+    def _make_toolbar_btn(self, text: str, tooltip: str, callback) -> QPushButton:
+        btn = QPushButton(text)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFixedHeight(30)
+        btn.setToolTip(tooltip)
+        btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {self.theme['input_bg']};
+                color: {self.theme['text']};
+                border-radius: 4px;
+                padding: 6px 12px;
+                font-size: 12px;
+                border: none;
+            }}
+            QPushButton:hover {{
+                background: {self.theme['accent']};
+                color: {self.theme['accent_text']};
+            }}
+            QPushButton:pressed {{
+                background: {self.theme['accent_hover']};
+            }}
+        """)
+        btn.clicked.connect(callback)
+        return btn
+
     def _create_left_panel(self) -> QFrame:
-        """Создаёт левую панель с деревом проекта."""
         frame = QFrame()
-        frame.setMinimumWidth(200)
-        frame.setMaximumWidth(320)
+        frame.setMinimumWidth(220)
+        frame.setMaximumWidth(350)
         frame.setStyleSheet(f"""
             QFrame {{
-                background-color: {self.theme['frame_bg']};
-                border-radius: 10px;
+                background-color: {self.theme['sidebar_bg']};
+                border-radius: 6px;
                 border: 1px solid {self.theme['frame_border']};
             }}
         """)
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
-        # Заголовок
-        title_layout = QHBoxLayout()
-        title = QLabel("📁 Проект")
-        title.setStyleSheet(f"color: {self.theme['text']}; font-weight: bold; font-size: 13px;")
-        title_layout.addWidget(title)
+        title = QLabel("📁 ПРОЕКТ")
+        title.setStyleSheet(f"color: {self.theme['text_dim']}; font-weight: bold; font-size: 11px;")
+        layout.addWidget(title)
 
-        # Путь к проекту
         self.path_label = QLabel(self.project_path)
-        self.path_label.setStyleSheet(f"color: {self.theme['text']}; font-size: 10px; opacity: 0.7;")
+        self.path_label.setStyleSheet(f"color: {self.theme['text']}; font-size: 10px; padding: 2px;")
         self.path_label.setWordWrap(True)
-        title_layout.addWidget(self.path_label)
-        title_layout.addStretch()
+        layout.addWidget(self.path_label)
 
-        layout.addLayout(title_layout)
+        self.search_field = QLineEdit()
+        self.search_field.setPlaceholderText("🔍 Поиск файла...")
+        self.search_field.setStyleSheet(f"""
+            QLineEdit {{
+                background: {self.theme['input_bg']};
+                color: {self.theme['text']};
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 11px;
+                border: none;
+            }}
+        """)
+        self.search_field.textChanged.connect(self._filter_tree)
+        layout.addWidget(self.search_field)
 
-        # Дерево файлов
         self.file_tree = QTreeWidget()
         self.file_tree.setHeaderHidden(True)
+        self.file_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.file_tree.customContextMenuRequested.connect(self._show_tree_context_menu)
         self.file_tree.setStyleSheet(f"""
             QTreeWidget {{
                 background-color: {self.theme['chat_bg']};
                 color: {self.theme['text']};
-                border-radius: 8px;
+                border-radius: 4px;
                 border: none;
                 font-size: 12px;
                 padding: 4px;
+            }}
+            QTreeWidget::item {{
+                padding: 2px;
             }}
             QTreeWidget::item:hover {{
                 background-color: {self.theme['input_bg']};
@@ -413,50 +595,37 @@ class ProgrammerWindow(QWidget):
         self.file_tree.itemDoubleClicked.connect(self.on_file_double_click)
         layout.addWidget(self.file_tree)
 
-        # Кнопки управления деревом
         btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(6)
+        btn_layout.setSpacing(4)
 
-        self.btn_refresh = QPushButton("🔄")
-        self.btn_refresh.setFixedSize(32, 32)
-        self.btn_refresh.setToolTip("Обновить дерево")
-        self.btn_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_refresh.setStyleSheet(self._btn_style())
-        self.btn_refresh.clicked.connect(self.load_project_tree)
-        btn_layout.addWidget(self.btn_refresh)
-
-        self.btn_expand = QPushButton("➕")
-        self.btn_expand.setFixedSize(32, 32)
-        self.btn_expand.setToolTip("Развернуть всё")
-        self.btn_expand.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_expand.setStyleSheet(self._btn_style())
-        self.btn_expand.clicked.connect(self.expand_all)
-        btn_layout.addWidget(self.btn_expand)
-
-        self.btn_collapse = QPushButton("➖")
-        self.btn_collapse.setFixedSize(32, 32)
-        self.btn_collapse.setToolTip("Свернуть всё")
-        self.btn_collapse.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_collapse.setStyleSheet(self._btn_style())
-        self.btn_collapse.clicked.connect(self.collapse_all)
-        btn_layout.addWidget(self.btn_collapse)
+        for text, tooltip, callback in [
+            ("🔄", "Обновить дерево", self.load_project_tree),
+            ("➕", "Развернуть всё", self.expand_all),
+            ("➖", "Свернуть всё", self.collapse_all),
+        ]:
+            btn = QPushButton(text)
+            btn.setFixedSize(30, 30)
+            btn.setToolTip(tooltip)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(self._btn_style())
+            btn.clicked.connect(callback)
+            btn_layout.addWidget(btn)
 
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
 
-        # Прогресс-бар
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         self.progress_bar.setStyleSheet(f"""
             QProgressBar {{
                 background-color: {self.theme['input_bg']};
-                border-radius: 4px;
-                height: 6px;
+                border-radius: 3px;
+                height: 4px;
                 text-align: center;
             }}
             QProgressBar::chunk {{
                 background-color: {self.theme['accent']};
-                border-radius: 4px;
+                border-radius: 3px;
             }}
         """)
         layout.addWidget(self.progress_bar)
@@ -464,47 +633,60 @@ class ProgrammerWindow(QWidget):
         return frame
 
     def _create_center_panel(self) -> QFrame:
-        """Создаёт центральную панель с чатом, редактором, консолью и терминалом."""
         frame = QFrame()
         frame.setMinimumWidth(500)
         frame.setStyleSheet(f"""
             QFrame {{
                 background-color: {self.theme['frame_bg']};
-                border-radius: 10px;
+                border-radius: 6px;
                 border: 1px solid {self.theme['frame_border']};
             }}
         """)
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
-        # Вкладки
         self.tabs = QTabWidget()
+        self.tabs.setTabsClosable(False)
+        self.tabs.setMovable(True)
         self.tabs.setStyleSheet(f"""
             QTabWidget::pane {{
                 background: {self.theme['frame_bg']};
-                border-radius: 8px;
-                padding: 4px;
+                border-radius: 4px;
+                border: 1px solid {self.theme['frame_border']};
+                padding: 2px;
             }}
             QTabBar::tab {{
                 background: {self.theme['input_bg']};
                 color: {self.theme['text']};
-                padding: 6px 12px;
-                border-radius: 6px;
-                margin-right: 4px;
+                padding: 6px 14px;
+                border-radius: 4px 4px 0 0;
+                margin-right: 2px;
+                font-size: 12px;
             }}
             QTabBar::tab:selected {{
                 background: {self.theme['accent']};
                 color: {self.theme['accent_text']};
             }}
+            QTabBar::tab:hover {{
+                background: {self.theme['accent_hover']};
+            }}
         """)
         layout.addWidget(self.tabs)
 
-        # Вкладка 1: Чат
-        chat_tab = QWidget()
-        chat_layout = QVBoxLayout(chat_tab)
-        chat_layout.setContentsMargins(4, 4, 4, 4)
-        chat_layout.setSpacing(6)
+        self.tabs.addTab(self._create_chat_tab(), "💬 Чат")
+        self.tabs.addTab(self._create_editor_tab(), "📝 Редактор")
+        self.tabs.addTab(self._create_console_tab(), "🖥️ Консоль")
+        self.tabs.addTab(self._create_terminal_tab(), "⚡ Терминал")
+        self.tabs.addTab(self._create_logs_tab(), "📊 Логи")
+
+        return frame
+
+    def _create_chat_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(6)
 
         self.chat_display = QTextEdit()
         self.chat_display.setReadOnly(True)
@@ -513,19 +695,19 @@ class ProgrammerWindow(QWidget):
             QTextEdit {{
                 background-color: {self.theme['chat_bg']};
                 color: {self.theme['text']};
-                border-radius: 8px;
+                border-radius: 4px;
                 border: none;
                 font-size: 13px;
                 padding: 8px;
-                font-family: 'Segoe UI', Consolas, monospace;
+                font-family: 'Segoe UI', sans-serif;
             }}
         """)
-        chat_layout.addWidget(self.chat_display, stretch=1)
+        layout.addWidget(self.chat_display, stretch=1)
 
         self.typing_label = QLabel("🤔 Z думает...")
-        self.typing_label.setStyleSheet(f"color: {self.theme['text']}; font-size: 11px; padding: 4px;")
+        self.typing_label.setStyleSheet(f"color: {self.theme['info']}; font-size: 11px; padding: 2px;")
         self.typing_label.hide()
-        chat_layout.addWidget(self.typing_label)
+        layout.addWidget(self.typing_label)
 
         input_layout = QHBoxLayout()
         self.input_field = QLineEdit()
@@ -534,7 +716,7 @@ class ProgrammerWindow(QWidget):
             QLineEdit {{
                 background-color: {self.theme['input_bg']};
                 color: {self.theme['text']};
-                border-radius: 8px;
+                border-radius: 4px;
                 border: none;
                 padding: 8px 12px;
                 font-size: 13px;
@@ -544,74 +726,81 @@ class ProgrammerWindow(QWidget):
         input_layout.addWidget(self.input_field)
 
         self.send_btn = QPushButton("➤")
-        self.send_btn.setFixedSize(38, 38)
+        self.send_btn.setFixedSize(36, 36)
         self.send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.send_btn.setStyleSheet(f"""
             QPushButton {{
                 background: {self.theme['accent']};
                 color: {self.theme['accent_text']};
-                border-radius: 8px;
+                border-radius: 4px;
                 font-size: 16px;
                 border: none;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background: {self.theme['accent_hover']};
             }}
         """)
         self.send_btn.clicked.connect(self.send_message)
         input_layout.addWidget(self.send_btn)
 
-        chat_layout.addLayout(input_layout)
-        self.tabs.addTab(chat_tab, "💬 Чат")
+        layout.addLayout(input_layout)
+        return tab
 
-        # Вкладка 2: Редактор кода
-        editor_tab = QWidget()
-        editor_layout = QVBoxLayout(editor_tab)
-        editor_layout.setContentsMargins(4, 4, 4, 4)
-        editor_layout.setSpacing(4)
+    def _create_editor_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
 
-        self.code_editor = QPlainTextEdit()
-        self.code_editor.setPlaceholderText("Здесь можно писать код...")
+        self.file_header = QLabel("📄 Нет открытого файла")
+        self.file_header.setStyleSheet(
+            f"color: {self.theme['text_dim']}; font-size: 11px; "
+            f"padding: 4px 8px; background: {self.theme['input_bg']}; border-radius: 4px;"
+        )
+        layout.addWidget(self.file_header)
+
+        self.code_editor = CodeEditor(self.theme)
         self.code_editor.setStyleSheet(f"""
             QPlainTextEdit {{
                 background-color: {self.theme['code_bg']};
                 color: {self.theme['text']};
-                border-radius: 8px;
+                border-radius: 4px;
                 border: 1px solid {self.theme['frame_border']};
-                font-family: 'Consolas', 'Segoe UI', monospace;
-                font-size: 14px;
-                padding: 8px;
+                font-family: 'Consolas', monospace;
+                font-size: 13px;
+                padding: 4px;
+                selection-background-color: {self.theme['accent']};
             }}
         """)
-        self.highlighter = PythonHighlighter(self.code_editor.document())
-        editor_layout.addWidget(self.code_editor, stretch=1)
+        self.highlighter = PythonHighlighter(self.code_editor.document(), self.theme)
+        self.code_editor.cursorPositionChanged.connect(self._update_cursor_pos)
+        layout.addWidget(self.code_editor, stretch=1)
 
         editor_buttons = QHBoxLayout()
-        self.btn_editor_save = QPushButton("💾 Сохранить")
-        self.btn_editor_save.setFixedSize(100, 28)
-        self.btn_editor_save.setStyleSheet(self._btn_style())
-        self.btn_editor_save.clicked.connect(self.save_current_file)
-        editor_buttons.addWidget(self.btn_editor_save)
+        editor_buttons.setSpacing(4)
 
-        self.btn_editor_run = QPushButton("▶️ Запустить")
-        self.btn_editor_run.setFixedSize(100, 28)
-        self.btn_editor_run.setStyleSheet(self._btn_style())
-        self.btn_editor_run.clicked.connect(self.run_current_file)
-        editor_buttons.addWidget(self.btn_editor_run)
-
-        self.btn_auto_complete = QPushButton("✨ Продолжить код")
-        self.btn_auto_complete.setFixedSize(120, 28)
-        self.btn_auto_complete.setStyleSheet(self._btn_style())
-        self.btn_auto_complete.clicked.connect(self.auto_complete_code)
-        editor_buttons.addWidget(self.btn_auto_complete)
+        for text, callback in [
+            ("💾 Сохранить", self.save_current_file),
+            ("▶️ Запустить", self.run_current_file),
+            ("✨ Продолжить код", self.auto_complete_code),
+            ("🔍 Проверить", self.lint_code),
+        ]:
+            btn = QPushButton(text)
+            btn.setFixedHeight(28)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(self._btn_style())
+            btn.clicked.connect(callback)
+            editor_buttons.addWidget(btn)
 
         editor_buttons.addStretch()
-        editor_layout.addLayout(editor_buttons)
+        layout.addLayout(editor_buttons)
+        return tab
 
-        self.tabs.addTab(editor_tab, "📝 Редактор")
-
-        # Вкладка 3: Консоль
-        console_tab = QWidget()
-        console_layout = QVBoxLayout(console_tab)
-        console_layout.setContentsMargins(4, 4, 4, 4)
-        console_layout.setSpacing(4)
+    def _create_console_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(4, 4, 4, 4)
 
         self.console = QTextEdit()
         self.console.setReadOnly(True)
@@ -619,22 +808,44 @@ class ProgrammerWindow(QWidget):
             QTextEdit {{
                 background-color: {self.theme['console_bg']};
                 color: {self.theme['text']};
-                border-radius: 8px;
+                border-radius: 4px;
                 border: 1px solid {self.theme['frame_border']};
-                font-family: 'Consolas', 'Segoe UI', monospace;
+                font-family: 'Consolas', monospace;
                 font-size: 12px;
                 padding: 8px;
             }}
         """)
-        console_layout.addWidget(self.console, stretch=1)
+        layout.addWidget(self.console)
+        return tab
 
-        self.tabs.addTab(console_tab, "🖥️ Консоль")
+    def _create_terminal_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
 
-        # Вкладка 4: Терминал
-        terminal_tab = QWidget()
-        terminal_layout = QVBoxLayout(terminal_tab)
-        terminal_layout.setContentsMargins(4, 4, 4, 4)
-        terminal_layout.setSpacing(4)
+        quick_layout = QHBoxLayout()
+        quick_layout.setSpacing(4)
+
+        quick_label = QLabel("⚡ Быстро:")
+        quick_label.setStyleSheet(f"color: {self.theme['text_dim']}; font-size: 11px;")
+        quick_layout.addWidget(quick_label)
+
+        for text, cmd in [
+            ("🚀 Zeta", "start_zeta.bat"),
+            ("🌐 Web", "start_web.bat"),
+            ("📱 Bot", "start_zeta_bot.bat"),
+            ("🛠️ Все", "start_all.bat"),
+        ]:
+            btn = QPushButton(text)
+            btn.setFixedHeight(26)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(self._btn_style())
+            btn.clicked.connect(lambda _, c=cmd: self._run_quick_command(c))
+            quick_layout.addWidget(btn)
+
+        quick_layout.addStretch()
+        layout.addLayout(quick_layout)
 
         self.terminal_output = QTextEdit()
         self.terminal_output.setReadOnly(True)
@@ -642,14 +853,14 @@ class ProgrammerWindow(QWidget):
             QTextEdit {{
                 background-color: {self.theme['console_bg']};
                 color: {self.theme['text']};
-                border-radius: 8px;
+                border-radius: 4px;
                 border: 1px solid {self.theme['frame_border']};
-                font-family: 'Consolas', 'Segoe UI', monospace;
+                font-family: 'Consolas', monospace;
                 font-size: 12px;
                 padding: 8px;
             }}
         """)
-        terminal_layout.addWidget(self.terminal_output, stretch=1)
+        layout.addWidget(self.terminal_output, stretch=1)
 
         terminal_input_layout = QHBoxLayout()
         self.terminal_input = QLineEdit()
@@ -658,7 +869,7 @@ class ProgrammerWindow(QWidget):
             QLineEdit {{
                 background-color: {self.theme['input_bg']};
                 color: {self.theme['text']};
-                border-radius: 8px;
+                border-radius: 4px;
                 border: none;
                 padding: 8px 12px;
                 font-size: 13px;
@@ -668,60 +879,97 @@ class ProgrammerWindow(QWidget):
         self.terminal_input.returnPressed.connect(self.run_terminal_command)
         terminal_input_layout.addWidget(self.terminal_input)
 
-        self.terminal_run_btn = QPushButton("▶️ Выполнить")
-        self.terminal_run_btn.setFixedSize(100, 30)
-        self.terminal_run_btn.setStyleSheet(self._btn_style())
-        self.terminal_run_btn.clicked.connect(self.run_terminal_command)
-        terminal_input_layout.addWidget(self.terminal_run_btn)
+        run_btn = QPushButton("▶️ Выполнить")
+        run_btn.setFixedHeight(28)
+        run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        run_btn.setStyleSheet(self._btn_style())
+        run_btn.clicked.connect(self.run_terminal_command)
+        terminal_input_layout.addWidget(run_btn)
 
-        terminal_layout.addLayout(terminal_input_layout)
+        layout.addLayout(terminal_input_layout)
+        return tab
 
-        self.tabs.addTab(terminal_tab, "🖥️ Терминал")
+    def _create_logs_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
 
-        return frame
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(4)
+
+        for text, callback in [
+            ("🔄 Обновить", self._load_logs),
+            ("📂 Открыть папку", lambda: subprocess.Popen(f'explorer "{self.project_path}\\data"', shell=True)),
+            ("🧹 Очистить UI", lambda: self.logs_display.clear()),
+        ]:
+            btn = QPushButton(text)
+            btn.setFixedHeight(26)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(self._btn_style())
+            btn.clicked.connect(callback)
+            btn_layout.addWidget(btn)
+
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        self.logs_display = QTextEdit()
+        self.logs_display.setReadOnly(True)
+        self.logs_display.setStyleSheet(f"""
+            QTextEdit {{
+                background-color: {self.theme['console_bg']};
+                color: {self.theme['text']};
+                border-radius: 4px;
+                border: 1px solid {self.theme['frame_border']};
+                font-family: 'Consolas', monospace;
+                font-size: 11px;
+                padding: 8px;
+            }}
+        """)
+        layout.addWidget(self.logs_display)
+        return tab
 
     def _create_right_panel(self) -> QFrame:
-        """Создаёт правую панель с инструментами и Git."""
         frame = QFrame()
-        frame.setMinimumWidth(200)
-        frame.setMaximumWidth(280)
+        frame.setMinimumWidth(220)
+        frame.setMaximumWidth(320)
         frame.setStyleSheet(f"""
             QFrame {{
-                background-color: {self.theme['frame_bg']};
-                border-radius: 10px;
+                background-color: {self.theme['sidebar_bg']};
+                border-radius: 6px;
                 border: 1px solid {self.theme['frame_border']};
             }}
         """)
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(6)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(4)
 
-        # Инструменты
-        title = QLabel("🛠️ Инструменты")
-        title.setStyleSheet(f"color: {self.theme['text']}; font-weight: bold; font-size: 13px;")
+        title = QLabel("🛠️ ИНСТРУМЕНТЫ")
+        title.setStyleSheet(f"color: {self.theme['text_dim']}; font-weight: bold; font-size: 11px;")
         layout.addWidget(title)
 
         tools = [
-            ("🌐 Chrome", self.open_chrome),
+            ("🌐 Edge", self.open_edge),
             ("📝 VS Code", self.open_vscode),
             ("📁 Проводник", self.open_explorer),
             ("⚙️ Диспетчер", self.open_taskmgr),
             ("🖥️ Терминал", self.open_terminal),
-            ("📋 Копировать", self.copy_code),
+            ("📋 Копировать код", self.copy_code),
             ("📂 Открыть файл", self.open_selected_file),
+            ("📦 Установить пакет", self.install_package),
         ]
 
         for label, callback in tools:
             btn = QPushButton(label)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFixedHeight(28)
             btn.setStyleSheet(self._btn_style())
             btn.clicked.connect(callback)
             layout.addWidget(btn)
 
-        # Git секция
-        layout.addSpacing(10)
-        git_title = QLabel("🔧 Git")
-        git_title.setStyleSheet(f"color: {self.theme['text']}; font-weight: bold; font-size: 13px;")
+        layout.addSpacing(8)
+        git_title = QLabel("🔧 GIT")
+        git_title.setStyleSheet(f"color: {self.theme['text_dim']}; font-weight: bold; font-size: 11px;")
         layout.addWidget(git_title)
 
         git_tools = [
@@ -738,29 +986,33 @@ class ProgrammerWindow(QWidget):
         for label, callback in git_tools:
             btn = QPushButton(label)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFixedHeight(26)
             btn.setStyleSheet(self._btn_style())
             btn.clicked.connect(callback)
             layout.addWidget(btn)
 
         layout.addStretch()
 
-        # Информация
-        info_label = QLabel("💡 Двойной клик по файлу → открыть в редакторе")
-        info_label.setStyleSheet(f"color: {self.theme['text']}; font-size: 10px; opacity: 0.7;")
-        info_label.setWordWrap(True)
-        layout.addWidget(info_label)
+        hint = QLabel(
+            "💡 Двойной клик по файлу → открыть\n"
+            "💡 ПКМ в дереве → контекстное меню\n"
+            "💡 Ctrl+S — сохранить\n"
+            "💡 Ctrl+R — запустить\n"
+            "💡 Ctrl+B — проверить"
+        )
+        hint.setStyleSheet(f"color: {self.theme['text_dim']}; font-size: 10px; padding: 4px;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
 
         return frame
-
-    # ========== СТИЛИ ==========
 
     def _btn_style(self) -> str:
         return f"""
             QPushButton {{
                 background: {self.theme['input_bg']};
                 color: {self.theme['text']};
-                border-radius: 8px;
-                padding: 6px 10px;
+                border-radius: 4px;
+                padding: 4px 8px;
                 font-size: 12px;
                 border: none;
                 text-align: left;
@@ -769,159 +1021,43 @@ class ProgrammerWindow(QWidget):
                 background: {self.theme['accent']};
                 color: {self.theme['accent_text']};
             }}
-            QPushButton:disabled {{
-                opacity: 0.5;
+            QPushButton:pressed {{
+                background: {self.theme['accent_hover']};
             }}
         """
 
-    # ========== ПОДСВЕТКА СИНТАКСИСА ==========
-
-    def _highlight_code(self, text: str, language: str = "python") -> str:
-        """Возвращает HTML с подсветкой синтаксиса."""
-        if not text:
-            return ""
-
-        colors = SYNTAX_COLORS.get(language, SYNTAX_COLORS["python"])
-        escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-        escaped = re.sub(
-            r'(["\'])(.*?)\1',
-            lambda m: f'<span style="color:{colors["string"]};">{m.group(0)}</span>',
-            escaped
-        )
-
-        escaped = re.sub(
-            r'(#.*?$)',
-            lambda m: f'<span style="color:{colors["comment"]};">{m.group(0)}</span>',
-            escaped,
-            flags=re.MULTILINE
-        )
-
-        keywords = [
-            "def", "class", "return", "if", "elif", "else", "for", "while",
-            "import", "from", "try", "except", "finally", "with", "as", "pass",
-            "break", "continue", "lambda", "yield", "global", "nonlocal",
-            "True", "False", "None", "async", "await", "in", "is", "not", "and", "or"
+    def setup_hotkeys(self):
+        shortcuts = [
+            ("Ctrl+S", self.save_current_file),
+            ("Ctrl+R", self.run_current_file),
+            ("Ctrl+B", self.lint_code),
+            ("Ctrl+O", self.open_file_dialog),
+            ("Ctrl+Shift+V", self.open_in_vscode),
+            ("Ctrl+T", lambda: self.tabs.setCurrentIndex((self.tabs.currentIndex() + 1) % self.tabs.count())),
+            ("Ctrl+Shift+T", lambda: self.tabs.setCurrentIndex(3)),
+            ("Ctrl+Shift+L", lambda: self.tabs.setCurrentIndex(4)),
+            ("Escape", self.close),
         ]
-        for kw in keywords:
-            escaped = re.sub(
-                rf'\b{kw}\b',
-                f'<span style="color:{colors["keyword"]}; font-weight:bold;">{kw}</span>',
-                escaped
-            )
-
-        escaped = re.sub(
-            r'(\w+)(?=\s*\()',
-            lambda m: f'<span style="color:{colors["function"]};">{m.group(0)}</span>',
-            escaped
-        )
-
-        return escaped
-
-    def _append_colored(self, sender: str, text: str, color: str):
-        """Добавляет цветное сообщение в чат."""
-        cursor = self.chat_display.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-
-        fmt_name = QTextCharFormat()
-        fmt_name.setForeground(QColor(color))
-        fmt_name.setFontWeight(QFont.Weight.Bold)
-        cursor.insertText(f"{sender}: ", fmt_name)
-
-        if "```" in text:
-            parts = text.split("```")
-            for i, part in enumerate(parts):
-                if i % 2 == 1:
-                    language = "python"
-                    if "\n" in part:
-                        first_line = part.split("\n")[0].strip()
-                        if first_line in ["python", "js", "javascript", "html", "css"]:
-                            language = first_line
-                            part = part.split("\n", 1)[1] if "\n" in part else ""
-
-                    fmt_code = QTextCharFormat()
-                    fmt_code.setBackground(QColor(self.theme["code_bg"]))
-                    fmt_code.setForeground(QColor(self.theme["text"]))
-                    cursor.insertText(part, fmt_code)
-
-                    fmt_break = QTextCharFormat()
-                    fmt_break.setForeground(QColor(self.theme["text"]))
-                    cursor.insertText("\n", fmt_break)
-                else:
-                    fmt_text = QTextCharFormat()
-                    fmt_text.setForeground(QColor(self.theme["text"]))
-                    cursor.insertText(part, fmt_text)
-        else:
-            fmt_text = QTextCharFormat()
-            fmt_text.setForeground(QColor(self.theme["text"]))
-            cursor.insertText(text, fmt_text)
-
-        cursor.insertText("\n\n")
-        self.chat_display.setTextCursor(cursor)
-        self._scroll_to_bottom()
-
-    def _replace_last_z(self, text: str):
-        """Заменяет последнее сообщение Z с подсветкой."""
-        if self._z_block_start is None:
-            return
-
-        cursor = self.chat_display.textCursor()
-        cursor.setPosition(self._z_block_start)
-        cursor.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
-        cursor.removeSelectedText()
-
-        fmt_name = QTextCharFormat()
-        fmt_name.setForeground(QColor(self.theme["accent"]))
-        fmt_name.setFontWeight(QFont.Weight.Bold)
-        cursor.insertText("Z: ", fmt_name)
-
-        if "```" in text:
-            parts = text.split("```")
-            for i, part in enumerate(parts):
-                if i % 2 == 1:
-                    language = "python"
-                    if "\n" in part:
-                        first_line = part.split("\n")[0].strip()
-                        if first_line in ["python", "js", "javascript", "html", "css"]:
-                            language = first_line
-                            part = part.split("\n", 1)[1] if "\n" in part else ""
-
-                    fmt_code = QTextCharFormat()
-                    fmt_code.setBackground(QColor(self.theme["code_bg"]))
-                    fmt_code.setForeground(QColor(self.theme["text"]))
-                    cursor.insertText(part, fmt_code)
-
-                    fmt_break = QTextCharFormat()
-                    fmt_break.setForeground(QColor(self.theme["text"]))
-                    cursor.insertText("\n", fmt_break)
-                else:
-                    fmt_text = QTextCharFormat()
-                    fmt_text.setForeground(QColor(self.theme["text"]))
-                    cursor.insertText(part, fmt_text)
-        else:
-            fmt_text = QTextCharFormat()
-            fmt_text.setForeground(QColor(self.theme["text"]))
-            cursor.insertText(text, fmt_text)
-
-        cursor.insertText("\n")
-        self.chat_display.setTextCursor(cursor)
-        self._scroll_to_bottom()
-
-    def _scroll_to_bottom(self):
-        sb = self.chat_display.verticalScrollBar()
-        sb.setValue(sb.maximum())
-
-    # ========== РАБОТА С ЧАТОМ ==========
+        for key, callback in shortcuts:
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.activated.connect(callback)
 
     def greet(self):
         self._append_colored(
             "Z",
-            "💻 Режим программиста активирован.\n"
+            "💻 **Режим разработчика** активирован.\n"
             "Здесь я знаю Python, JS, C++, Unity, Godot, архитектуру LLM и всё остальное.\n"
             "Можешь задавать вопросы по коду, просить написать функцию или объяснить алгоритм.\n\n"
-            "📁 Слева — дерево проекта.\n"
-            "🛠️ Справа — инструменты и Git.\n"
-            "✨ В редакторе есть кнопка 'Продолжить код' для автодополнения.",
+            "📁 Слева — дерево проекта (с поиском).\n"
+            "📝 По центру — чат, редактор, консоль, терминал, логи.\n"
+            "🛠️ Справа — инструменты и Git.\n\n"
+            "💡 Горячие клавиши:\n"
+            "   Ctrl+S — сохранить\n"
+            "   Ctrl+R — запустить\n"
+            "   Ctrl+B — проверить код\n"
+            "   Ctrl+T — след. вкладка\n"
+            "   Ctrl+Shift+T — терминал\n"
+            "   Ctrl+Shift+L — логи",
             self.theme["accent"]
         )
 
@@ -931,7 +1067,7 @@ class ProgrammerWindow(QWidget):
             return
 
         self.input_field.clear()
-        self._append_colored("Ты", text, "#a6e3a1")
+        self._append_colored("Ты", text, "#4ec9b0")
 
         self._z_block_start = self.chat_display.textCursor().position()
         self._append_colored("Z", "думает...", self.theme["accent"])
@@ -956,7 +1092,10 @@ class ProgrammerWindow(QWidget):
         self._replace_last_z(full_text)
 
         if get_setting("voice_enabled", "true") == "true":
-            speak(full_text)
+            try:
+                speak(full_text[:500])
+            except Exception:
+                pass
 
     def _on_error(self, error_msg: str):
         self.typing_label.hide()
@@ -964,8 +1103,77 @@ class ProgrammerWindow(QWidget):
         self.send_btn.setText("➤")
         self._replace_last_z(error_msg)
 
+    def _append_colored(self, sender: str, text: str, color: str):
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+
+        fmt_name = QTextCharFormat()
+        fmt_name.setForeground(QColor(color))
+        fmt_name.setFontWeight(QFont.Weight.Bold)
+        cursor.insertText(f"{sender}: ", fmt_name)
+
+        self._insert_code_or_text(cursor, text)
+
+        cursor.insertText("\n\n")
+        self.chat_display.setTextCursor(cursor)
+        self._scroll_to_bottom()
+
+    def _replace_last_z(self, text: str):
+        if self._z_block_start is None:
+            return
+
+        cursor = self.chat_display.textCursor()
+        cursor.setPosition(self._z_block_start)
+        cursor.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
+        cursor.removeSelectedText()
+
+        fmt_name = QTextCharFormat()
+        fmt_name.setForeground(QColor(self.theme["accent"]))
+        fmt_name.setFontWeight(QFont.Weight.Bold)
+        cursor.insertText("Z: ", fmt_name)
+
+        self._insert_code_or_text(cursor, text)
+
+        cursor.insertText("\n")
+        self.chat_display.setTextCursor(cursor)
+        self._scroll_to_bottom()
+
+    def _insert_code_or_text(self, cursor, text: str):
+        if "```" not in text:
+            fmt = QTextCharFormat()
+            fmt.setForeground(QColor(self.theme["text"]))
+            cursor.insertText(text, fmt)
+            return
+
+        parts = text.split("```")
+        for i, part in enumerate(parts):
+            if i % 2 == 1:
+                language = "python"
+                if "\n" in part:
+                    first_line = part.split("\n")[0].strip()
+                    if first_line in ["python", "js", "javascript", "html", "css", "bash", "bat", "json"]:
+                        language = first_line
+                        part = part.split("\n", 1)[1] if "\n" in part else ""
+
+                fmt_code = QTextCharFormat()
+                fmt_code.setBackground(QColor(self.theme["code_bg"]))
+                fmt_code.setForeground(QColor("#d4d4d4"))
+                fmt_code.setFont(QFont("Consolas", 11))
+                cursor.insertText(part, fmt_code)
+
+                fmt_break = QTextCharFormat()
+                fmt_break.setForeground(QColor(self.theme["text"]))
+                cursor.insertText("\n", fmt_break)
+            else:
+                fmt = QTextCharFormat()
+                fmt.setForeground(QColor(self.theme["text"]))
+                cursor.insertText(part, fmt)
+
+    def _scroll_to_bottom(self):
+        sb = self.chat_display.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
     def clear_chat(self):
-        """Очищает чат."""
         reply = QMessageBox.question(
             self, "Очистить чат",
             "Очистить все сообщения в чате?",
@@ -975,12 +1183,8 @@ class ProgrammerWindow(QWidget):
             self.chat_display.clear()
             self.greet()
 
-    # ========== РАБОТА С ДЕРЕВОМ ПРОЕКТА ==========
-
     def load_project_tree(self):
-        """Загружает дерево проекта."""
         self.file_tree.clear()
-        self.file_tree_items.clear()
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
 
@@ -988,22 +1192,20 @@ class ProgrammerWindow(QWidget):
             project_path = get_current_project_path() or "D:\\Zeta"
             self.project_path = project_path
             self.path_label.setText(project_path)
-
             self._populate_tree(project_path)
         except Exception as e:
             self._append_colored("Z", f"⚠️ Ошибка загрузки проекта: {e}", self.theme["danger"])
         finally:
             self.progress_bar.setVisible(False)
-            self._append_colored("Z", "📁 Дерево проекта загружено.", self.theme["success"])
+            self.status_bar.showMessage("📁 Дерево проекта загружено", 3000)
 
     def _populate_tree(self, path: str, parent: Optional[QTreeWidgetItem] = None):
-        """Рекурсивно заполняет дерево."""
         if not os.path.exists(path):
             return
 
         try:
             items = sorted(os.listdir(path))
-            total = len(items)
+            total = max(len(items), 1)
             processed = 0
 
             for item in items:
@@ -1014,6 +1216,8 @@ class ProgrammerWindow(QWidget):
                 tree_parent = parent if parent else self.file_tree.invisibleRootItem()
 
                 if item.startswith(".") or item.startswith("__"):
+                    continue
+                if item in ("node_modules", "venv", "__pycache__", ".git", "build", "dist"):
                     continue
 
                 if os.path.isdir(full_path):
@@ -1038,24 +1242,80 @@ class ProgrammerWindow(QWidget):
                     file_item.setText(0, f"{icon} {item}")
                     file_item.setData(0, Qt.ItemDataRole.UserRole, full_path)
 
-            self.progress_bar.setValue(100)
-
         except PermissionError:
             pass
 
     def _get_file_icon(self, filename: str) -> str:
-        """Возвращает иконку для файла."""
         ext = os.path.splitext(filename)[1].lower()
         icons = {
             ".py": "🐍", ".js": "📜", ".ts": "📘", ".html": "🌐", ".css": "🎨",
             ".json": "📋", ".md": "📝", ".txt": "📄", ".xml": "📄", ".yaml": "📄",
             ".yml": "📄", ".toml": "📄", ".ini": "⚙️", ".cfg": "⚙️", ".conf": "⚙️",
             ".sh": "💻", ".bat": "💻", ".ps1": "💻", ".exe": "⚡", ".dll": "🔧",
-            ".so": "🔧", ".dylib": "🔧", ".jpg": "🖼️", ".jpeg": "🖼️", ".png": "🖼️",
-            ".gif": "🖼️", ".svg": "🖼️", ".ico": "🖼️", ".mp3": "🎵", ".mp4": "🎬",
-            ".wav": "🎵", ".zip": "📦", ".tar": "📦", ".gz": "📦", ".rar": "📦", ".7z": "📦",
+            ".jpg": "🖼️", ".png": "🖼️", ".gif": "🖼️", ".svg": "🖼️",
+            ".mp3": "🎵", ".mp4": "🎬", ".zip": "📦", ".rar": "📦",
         }
         return icons.get(ext, "📄")
+
+    def _filter_tree(self, text: str):
+        search = text.lower().strip()
+
+        def filter_item(item):
+            matches = search in item.text(0).lower()
+            child_matches = False
+            for i in range(item.childCount()):
+                if filter_item(item.child(i)):
+                    child_matches = True
+            visible = matches or child_matches
+            item.setHidden(not visible)
+            return visible
+
+        root = self.file_tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            filter_item(root.child(i))
+
+    def _show_tree_context_menu(self, position):
+        item = self.file_tree.itemAt(position)
+        if not item:
+            return
+
+        menu = QMenu(self)
+        path = item.data(0, Qt.ItemDataRole.UserRole)
+
+        if path:
+            open_action = menu.addAction("📂 Открыть в редакторе")
+            open_action.triggered.connect(lambda: self.on_file_double_click(item, 0))
+
+            vscode_action = menu.addAction("🧩 Открыть в VS Code")
+            vscode_action.triggered.connect(
+                lambda: subprocess.Popen(["code", path], shell=True)
+            )
+
+            menu.addSeparator()
+
+            copy_action = menu.addAction("📋 Копировать путь")
+            copy_action.triggered.connect(
+                lambda: QApplication.clipboard().setText(path)
+            )
+
+            explorer_action = menu.addAction("📁 Открыть в проводнике")
+            if os.path.isfile(path):
+                explorer_action.triggered.connect(
+                    lambda: subprocess.Popen(f'explorer /select,"{path}"', shell=True)
+                )
+            else:
+                explorer_action.triggered.connect(
+                    lambda: subprocess.Popen(f'explorer "{path}"', shell=True)
+                )
+
+            menu.addSeparator()
+
+            name_action = menu.addAction("📝 Копировать имя")
+            name_action.triggered.connect(
+                lambda: QApplication.clipboard().setText(os.path.basename(path))
+            )
+
+        menu.exec(self.file_tree.viewport().mapToGlobal(position))
 
     def expand_all(self):
         self.file_tree.expandAll()
@@ -1064,247 +1324,207 @@ class ProgrammerWindow(QWidget):
         self.file_tree.collapseAll()
 
     def on_file_double_click(self, item: QTreeWidgetItem, column: int):
-        """Обработка двойного клика по файлу."""
         path = item.data(0, Qt.ItemDataRole.UserRole)
         if path and os.path.isfile(path):
             self.current_file_path = path
             self.open_file_in_editor(path)
-            self._append_colored("Z", f"📄 Открыт файл: {os.path.basename(path)}", self.theme["success"])
 
     def open_file_in_editor(self, path: str):
-        """Открывает файл в редакторе кода."""
         try:
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read()
             self.code_editor.setPlainText(content)
+            self.current_file_path = path
+            self.file_header.setText(f"📄 {path}")
             self.tabs.setCurrentIndex(1)
+            self.status_bar.showMessage(f"📄 Открыт: {os.path.basename(path)}", 3000)
         except Exception as e:
             QMessageBox.warning(self, "Ошибка", f"Не удалось открыть файл: {e}")
 
     def save_current_file(self):
-        """Сохранение текущего файла в редакторе."""
         if not self.current_file_path:
-            path, _ = QFileDialog.getSaveFileName(self, "Сохранить файл", "", "Python Files (*.py);;All Files (*)")
-            if path:
-                self.current_file_path = path
-            else:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Сохранить файл", "", "Python Files (*.py);;All Files (*)"
+            )
+            if not path:
                 return
+            self.current_file_path = path
+            self.file_header.setText(f"📄 {path}")
 
         try:
             content = self.code_editor.toPlainText()
             with open(self.current_file_path, "w", encoding="utf-8") as f:
                 f.write(content)
-            QMessageBox.information(self, "Сохранено", f"Файл сохранён: {self.current_file_path}")
+            self.status_bar.showMessage(f"💾 Сохранено: {os.path.basename(self.current_file_path)}", 3000)
         except Exception as e:
             QMessageBox.warning(self, "Ошибка", f"Не удалось сохранить файл: {e}")
 
-    # ========== ИНСТРУМЕНТЫ ==========
+    def _auto_save(self):
+        if self.current_file_path and self.code_editor.toPlainText():
+            try:
+                with open(self.current_file_path, "w", encoding="utf-8") as f:
+                    f.write(self.code_editor.toPlainText())
+                self.status_bar.showMessage(
+                    f"💾 Авто-сохранено: {os.path.basename(self.current_file_path)}", 2000
+                )
+            except Exception:
+                pass
 
-    def open_chrome(self):
-        subprocess.Popen("start chrome", shell=True)
+    def _update_cursor_pos(self):
+        cursor = self.code_editor.textCursor()
+        line = cursor.blockNumber() + 1
+        col = cursor.columnNumber() + 1
+        self.cursor_pos_label.setText(f"Стр {line}, Кол {col}")
+
+    def open_edge(self):
+        subprocess.Popen("start msedge", shell=True)
 
     def open_vscode(self):
         subprocess.Popen("code", shell=True)
 
     def open_explorer(self):
-        subprocess.Popen("explorer", shell=True)
+        subprocess.Popen(f'explorer "{self.project_path}"', shell=True)
 
     def open_taskmgr(self):
         subprocess.Popen("taskmgr", shell=True)
 
     def open_terminal(self):
-        subprocess.Popen("start cmd", shell=True)
+        subprocess.Popen(f'start cmd /K "cd /d {self.project_path}"', shell=True)
 
     def open_file_dialog(self):
-        """Открывает файл через диалог."""
-        path, _ = QFileDialog.getOpenFileName(self, "Открыть файл", "", "Все файлы (*)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Открыть файл", self.project_path, "Все файлы (*)"
+        )
         if path:
             self.current_file_path = path
             self.open_file_in_editor(path)
 
     def open_in_vscode(self):
-        """Открывает текущий проект или файл в VS Code."""
         if self.current_file_path:
             subprocess.Popen(["code", self.current_file_path], shell=True)
         else:
             subprocess.Popen(["code", self.project_path], shell=True)
 
+    def install_package(self):
+        pkg, ok = QInputDialog.getText(
+            self, "Установить пакет",
+            "Введите имя пакета (например: requests):"
+        )
+        if ok and pkg.strip():
+            self.tabs.setCurrentIndex(3)
+            self.terminal_input.setText(f"pip install {pkg.strip()}")
+            self.run_terminal_command()
+
     def lint_code(self):
-        """Проверяет код на синтаксические ошибки."""
         code = self.code_editor.toPlainText()
         if not code:
             self._append_colored("Z", "⚠️ Редактор пуст.", self.theme["warning"])
             return
 
+        import tempfile
         try:
-            ast.parse(code)
-            self._append_colored("Z", "✅ Синтаксис корректен! Ошибок не найдено.", self.theme["success"])
-        except SyntaxError as e:
-            self._append_colored("Z", f"❌ Синтаксическая ошибка: {e}", self.theme["danger"])
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".py", delete=False, encoding="utf-8"
+            ) as f:
+                f.write(code)
+                temp_path = f.name
 
-    # ========== GIT ==========
+            result = subprocess.run(
+                ["python", "-m", "py_compile", temp_path],
+                capture_output=True, text=True, encoding="utf-8", errors="replace"
+            )
+            os.unlink(temp_path)
+
+            if result.returncode == 0:
+                self._append_colored("Z", "✅ Синтаксис корректен! Ошибок не найдено.", self.theme["success"])
+                self.lint_status.setText("✅ OK")
+            else:
+                self._append_colored("Z", f"❌ Ошибки:\n{result.stderr}", self.theme["danger"])
+                self.lint_status.setText("❌ Ошибки")
+        except Exception as e:
+            self._append_colored("Z", f"⚠️ Ошибка линтера: {e}", self.theme["danger"])
+
+    def lint_project(self):
+        self._append_colored("Z", "🔍 Проверяю весь проект...", self.theme["info"])
+        self.tabs.setCurrentIndex(0)
+
+        result = subprocess.run(
+            ["python", "-m", "compileall", "-q", self.project_path],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            cwd=self.project_path
+        )
+
+        if result.returncode == 0:
+            self._append_colored("Z", "✅ Весь проект: ошибок не найдено!", self.theme["success"])
+        else:
+            self._append_colored(
+                "Z",
+                f"❌ Найдены ошибки:\n{result.stdout[:2000]}\n{result.stderr[:1000]}",
+                self.theme["danger"]
+            )
+
+    def _git(self, *args) -> str:
+        try:
+            result = subprocess.run(
+                ["git"] + list(args),
+                capture_output=True, text=True, shell=False,
+                cwd=self.project_path,
+                encoding="utf-8", errors="replace", timeout=30
+            )
+            return result.stdout if result.returncode == 0 else result.stderr
+        except Exception as e:
+            return f"⚠️ {e}"
 
     def git_status(self):
-        try:
-            result = subprocess.run(
-                ["git", "status", "-sb"],
-                capture_output=True,
-                text=True,
-                shell=True,
-                cwd=self.project_path,
-                encoding='utf-8',
-                errors='replace'
-            )
-            output = result.stdout if result.returncode == 0 else result.stderr
-            self._append_colored("📊 Git Status", output or "Рабочая директория чиста", self.theme["info"])
-        except Exception as e:
-            self._append_colored("⚠️ Git", f"Ошибка: {e}", self.theme["danger"])
+        out = self._git("status", "-sb")
+        self._append_colored("📊 Git Status", out or "Чисто", self.theme["info"])
 
-    def git_log(self, n: int = 5):
-        try:
-            result = subprocess.run(
-                ["git", "log", f"-n{n}", "--oneline"],
-                capture_output=True,
-                text=True,
-                shell=True,
-                cwd=self.project_path,
-                encoding='utf-8',
-                errors='replace'
-            )
-            output = result.stdout if result.returncode == 0 else result.stderr
-            self._append_colored("📈 Git Log", output or "Нет коммитов", self.theme["info"])
-        except Exception as e:
-            self._append_colored("⚠️ Git", f"Ошибка: {e}", self.theme["danger"])
+    def git_log(self):
+        out = self._git("log", "-n5", "--oneline")
+        self._append_colored("📈 Git Log", out or "Нет коммитов", self.theme["info"])
 
     def git_diff(self):
-        try:
-            result = subprocess.run(
-                ["git", "diff"],
-                capture_output=True,
-                text=True,
-                shell=True,
-                cwd=self.project_path,
-                encoding='utf-8',
-                errors='replace'
-            )
-            output = result.stdout if result.returncode == 0 else result.stderr
-            self._append_colored("📝 Git Diff", output or "Нет изменений", self.theme["info"])
-        except Exception as e:
-            self._append_colored("⚠️ Git", f"Ошибка: {e}", self.theme["danger"])
+        out = self._git("diff")
+        self._append_colored("📝 Git Diff", out or "Нет изменений", self.theme["info"])
 
     def git_commit(self):
-        """Создаёт коммит."""
-        text, ok = QInputDialog.getText(self, "Git Commit", "Введите сообщение коммита:")
+        text, ok = QInputDialog.getText(self, "Git Commit", "Сообщение коммита:")
         if ok and text:
-            try:
-                result = subprocess.run(
-                    ["git", "add", ".", "&&", "git", "commit", "-m", text],
-                    capture_output=True,
-                    text=True,
-                    shell=True,
-                    cwd=self.project_path,
-                    encoding='utf-8',
-                    errors='replace'
-                )
-                output = result.stdout if result.returncode == 0 else result.stderr
-                self._append_colored("💾 Git Commit", output or "Коммит создан", self.theme["success"])
-            except Exception as e:
-                self._append_colored("⚠️ Git", f"Ошибка: {e}", self.theme["danger"])
+            self._git("add", ".")
+            out = self._git("commit", "-m", text)
+            self._append_colored("💾 Git Commit", out, self.theme["success"])
 
     def auto_commit(self):
-        """Авто-коммит с генерацией сообщения от Зеты."""
+        diff = self._git("diff", "--stat")
+        prompt = f"Сообщение git commit на русском до 50 символов. Изменения: {diff[:200]}"
         try:
-            diff_result = subprocess.run(
-                ["git", "diff", "--stat"],
-                capture_output=True,
-                text=True,
-                shell=True,
-                cwd=self.project_path,
-                encoding='utf-8',
-                errors='replace'
-            )
-            changes = diff_result.stdout if diff_result.returncode == 0 else ""
+            msg = ask_zeta(prompt, mode="programmer").strip().split("\n")[0][:50]
+        except Exception:
+            msg = "Обновление проекта"
 
-            prompt = (
-                f"Напиши короткое сообщение для git commit (до 50 символов) на русском. "
-                f"Изменения: {changes[:200] if changes else 'Обновление проекта'}"
-            )
-            commit_message = ask_zeta(prompt, mode="programmer").strip().split("\n")[0][:50]
-
-            result = subprocess.run(
-                ["git", "add", ".", "&&", "git", "commit", "-m", commit_message],
-                capture_output=True,
-                text=True,
-                shell=True,
-                cwd=self.project_path,
-                encoding='utf-8',
-                errors='replace'
-            )
-            output = result.stdout if result.returncode == 0 else result.stderr
-            self._append_colored("🤖 Авто-коммит", output or f"Коммит создан: {commit_message}", self.theme["success"])
-        except Exception as e:
-            self._append_colored("⚠️ Git", f"Ошибка: {e}", self.theme["danger"])
+        self._git("add", ".")
+        out = self._git("commit", "-m", msg)
+        self._append_colored("🤖 Авто-коммит", out or f"Коммит: {msg}", self.theme["success"])
 
     def git_branch(self):
-        try:
-            result = subprocess.run(
-                ["git", "branch", "-a"],
-                capture_output=True,
-                text=True,
-                shell=True,
-                cwd=self.project_path,
-                encoding='utf-8',
-                errors='replace'
-            )
-            output = result.stdout if result.returncode == 0 else result.stderr
-            self._append_colored("🌿 Git Branches", output or "Нет веток", self.theme["info"])
-        except Exception as e:
-            self._append_colored("⚠️ Git", f"Ошибка: {e}", self.theme["danger"])
+        out = self._git("branch", "-a")
+        self._append_colored("🌿 Git Branches", out, self.theme["info"])
 
     def git_stash(self):
-        """Сохраняет изменения в stash."""
-        try:
-            result = subprocess.run(
-                ["git", "stash", "save"],
-                capture_output=True,
-                text=True,
-                shell=True,
-                cwd=self.project_path,
-                encoding='utf-8',
-                errors='replace'
-            )
-            output = result.stdout if result.returncode == 0 else result.stderr
-            self._append_colored("📦 Git Stash", output or "Изменения сохранены в stash", self.theme["info"])
-        except Exception as e:
-            self._append_colored("⚠️ Git", f"Ошибка: {e}", self.theme["danger"])
+        out = self._git("stash", "save")
+        self._append_colored("📦 Git Stash", out, self.theme["info"])
 
     def git_pull(self):
-        """Обновляет проект из удалённого репозитория."""
-        try:
-            result = subprocess.run(
-                ["git", "pull"],
-                capture_output=True,
-                text=True,
-                shell=True,
-                cwd=self.project_path,
-                encoding='utf-8',
-                errors='replace'
-            )
-            output = result.stdout if result.returncode == 0 else result.stderr
-            self._append_colored("🔄 Git Pull", output or "Обновлений нет", self.theme["info"])
-        except Exception as e:
-            self._append_colored("⚠️ Git", f"Ошибка: {e}", self.theme["danger"])
-
-    # ========== ТЕРМИНАЛ ==========
+        out = self._git("pull")
+        self._append_colored("🔄 Git Pull", out, self.theme["info"])
 
     def run_terminal_command(self):
-        """Выполняет команду в терминале."""
         command = self.terminal_input.text().strip()
         if not command:
             return
 
         self.terminal_input.clear()
-        self.terminal_output.append(f"$ {command}")
+        self.terminal_output.append(f"<span style='color:#569cd6;'>$ {command}</span>")
 
         if self.run_process and self.run_process.isRunning():
             self.run_process.quit()
@@ -1315,121 +1535,127 @@ class ProgrammerWindow(QWidget):
         self.run_process.finished_process.connect(self.on_process_finished)
         self.run_process.start()
 
+    def _run_quick_command(self, command: str):
+        self.tabs.setCurrentIndex(3)
+        self.terminal_output.append(f"<span style='color:#569cd6;'>$ {command}</span>")
+        try:
+            subprocess.Popen(
+                f'start "" cmd /K "cd /d {self.project_path} && {command}"',
+                shell=True
+            )
+            self.terminal_output.append(f"✅ Запущено: {command}")
+        except Exception as e:
+            self.terminal_output.append(f"⚠️ Ошибка: {e}")
+
     def on_process_finished(self, exit_code: int):
-        self.terminal_output.append(f"✅ Завершено с кодом {exit_code}\n")
+        color = "#4ec9b0" if exit_code == 0 else "#f48771"
+        self.terminal_output.append(
+            f"<span style='color:{color};'>✅ Завершено (код {exit_code})</span>\n"
+        )
 
-    # ========== АВТОДОПОЛНЕНИЕ ==========
-
-    def auto_complete_code(self):
-        """Продолжает текущий код с помощью ИИ."""
-        code = self.code_editor.toPlainText()
-        if not code:
-            self._append_colored("Z", "⚠️ Редактор пуст. Напишите код для продолжения.", self.theme["warning"])
+    def _load_logs(self):
+        log_path = os.path.join(self.project_path, "data", "zeta.log")
+        if not os.path.exists(log_path):
+            self.logs_display.setPlainText("⚠️ Файл data/zeta.log не найден")
             return
 
-        self.status_bar.showMessage("✨ Зета дописывает код...")
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+
+            last = lines[-500:] if len(lines) > 500 else lines
+            self.logs_display.setPlainText("".join(last))
+            sb = self.logs_display.verticalScrollBar()
+            sb.setValue(sb.maximum())
+        except Exception as e:
+            self.logs_display.setPlainText(f"⚠️ Ошибка чтения: {e}")
+
+    def clear_console(self):
+        self.console.clear()
+
+    def auto_complete_code(self):
+        code = self.code_editor.toPlainText()
+        if not code:
+            self._append_colored("Z", "⚠️ Редактор пуст.", self.theme["warning"])
+            return
+
+        self.status_bar.showMessage("✨ Zeta дописывает код...", 0)
         self.auto_complete_worker = AutoCompleteWorker(code)
         self.auto_complete_worker.result_ready.connect(self.on_auto_complete_result)
         self.auto_complete_worker.start()
 
     def on_auto_complete_result(self, result: str):
-        """Вставляет продолжение кода в редактор."""
-        self.code_editor.appendPlainText(result)
-        self.status_bar.showMessage("✅ Код дополнен")
-
-    # ========== ЗАПУСК ФАЙЛА ==========
+        if result and not result.startswith("# ⚠️"):
+            cursor = self.code_editor.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.insertText("\n" + result)
+            self.status_bar.showMessage("✅ Код дополнен", 3000)
+        else:
+            self._append_colored("Z", result, self.theme["danger"])
+            self.status_bar.showMessage("⚠️ Ошибка дополнения", 3000)
 
     def run_current_file(self):
-        """Запускает текущий файл."""
         if not self.current_file_path:
-            self._append_colored("Z", "⚠️ Выберите файл в дереве проекта или в редакторе.", self.theme["warning"])
+            self._append_colored("Z", "⚠️ Откройте файл.", self.theme["warning"])
             return
 
         ext = os.path.splitext(self.current_file_path)[1].lower()
 
         if ext == ".py":
-            self._append_colored("Z", f"▶️ Запуск Python: {os.path.basename(self.current_file_path)}", self.theme["info"])
-            try:
-                result = subprocess.run(
-                    ["python", self.current_file_path],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    cwd=os.path.dirname(self.current_file_path),
-                    encoding='utf-8',
-                    errors='replace'
-                )
-                output = result.stdout if result.stdout else result.stderr
-                self._append_colored("📤 Вывод", output or "✅ Выполнено без вывода", self.theme["success"])
-                self.console.append(output)
-            except subprocess.TimeoutExpired:
-                self._append_colored("⚠️", "⏱️ Таймаут выполнения", self.theme["danger"])
-            except Exception as e:
-                self._append_colored("⚠️", f"Ошибка: {e}", self.theme["danger"])
-
-        elif ext in [".js", ".ts"]:
-            self._append_colored("Z", f"▶️ Запуск JavaScript: {os.path.basename(self.current_file_path)}", self.theme["info"])
-            try:
-                result = subprocess.run(
-                    ["node", self.current_file_path],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    cwd=os.path.dirname(self.current_file_path),
-                    encoding='utf-8',
-                    errors='replace'
-                )
-                output = result.stdout if result.stdout else result.stderr
-                self._append_colored("📤 Вывод", output or "✅ Выполнено без вывода", self.theme["success"])
-                self.console.append(output)
-            except subprocess.TimeoutExpired:
-                self._append_colored("⚠️", "⏱️ Таймаут выполнения", self.theme["danger"])
-            except Exception as e:
-                self._append_colored("⚠️", f"Ошибка: {e}", self.theme["danger"])
-
+            cmd = ["python", self.current_file_path]
+        elif ext in (".js", ".ts"):
+            cmd = ["node", self.current_file_path]
+        elif ext == ".bat":
+            cmd = ["cmd", "/c", self.current_file_path]
         else:
             self._append_colored("Z", f"⚠️ Неподдерживаемый формат: {ext}", self.theme["warning"])
+            return
 
-    def clear_console(self):
-        """Очищает консоль."""
-        self.console.clear()
+        self._append_colored("Z", f"▶️ Запуск: {os.path.basename(self.current_file_path)}", self.theme["info"])
+        self.tabs.setCurrentIndex(2)
+
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=60,
+                cwd=os.path.dirname(self.current_file_path),
+                encoding="utf-8", errors="replace"
+            )
+            output = result.stdout if result.stdout else result.stderr
+            self.console.append(output or "✅ Выполнено без вывода")
+
+            if result.returncode != 0:
+                self.console.append(f"❌ Код возврата: {result.returncode}")
+        except subprocess.TimeoutExpired:
+            self.console.append("⏱️ Таймаут выполнения")
+        except Exception as e:
+            self.console.append(f"⚠️ Ошибка: {e}")
 
     def copy_code(self):
-        """Копирует выделенный код из чата."""
         selected = self.chat_display.textCursor().selectedText()
         if selected:
             QApplication.clipboard().setText(selected)
-            self._append_colored("Z", "📋 Код скопирован в буфер обмена", self.theme["success"])
+            self._append_colored("Z", "📋 Скопировано", self.theme["success"])
         else:
-            self._append_colored("Z", "⚠️ Выделите код для копирования", self.theme["warning"])
+            self._append_colored("Z", "⚠️ Выделите код", self.theme["warning"])
 
     def open_selected_file(self):
-        """Открывает выбранный файл в VS Code."""
         selected = self.file_tree.currentItem()
         if not selected:
-            self._append_colored("Z", "⚠️ Выберите файл в дереве проекта.", self.theme["warning"])
+            self._append_colored("Z", "⚠️ Выберите файл", self.theme["warning"])
             return
 
         path = selected.data(0, Qt.ItemDataRole.UserRole)
         if path and os.path.isfile(path):
             self.current_file_path = path
             self.open_file_in_editor(path)
-            self._append_colored("Z", f"📄 Открыт файл: {os.path.basename(path)}", self.theme["success"])
-        else:
-            self._append_colored("Z", "⚠️ Это папка, выберите файл.", self.theme["warning"])
-
-    # ========== СОБЫТИЯ ==========
 
     def closeEvent(self, event):
-        if self.worker and self.worker.isRunning():
-            self.worker.quit()
-            self.worker.wait()
-        if self.auto_complete_worker and self.auto_complete_worker.isRunning():
-            self.auto_complete_worker.quit()
-            self.auto_complete_worker.wait()
-        if self.run_process and self.run_process.isRunning():
-            self.run_process.quit()
-            self.run_process.wait()
+        self._auto_save()
+
+        for worker in (self.worker, self.auto_complete_worker, self.run_process):
+            if worker and worker.isRunning():
+                worker.quit()
+                worker.wait()
         event.accept()
 
     def keyPressEvent(self, event):
@@ -1440,9 +1666,6 @@ class ProgrammerWindow(QWidget):
 
 # ========== ТЕСТ ==========
 if __name__ == "__main__":
-    from PyQt6.QtWidgets import QApplication
-    import sys
-
     app = QApplication(sys.argv)
     window = ProgrammerWindow()
     window.show()

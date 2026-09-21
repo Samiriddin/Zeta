@@ -1,13 +1,16 @@
 @echo off
 chcp 65001 >nul 2>&1
-title Zeta AI Assistant v4.0
+title Zeta AI Assistant v7.5
 cd /d D:\Zeta
+
+set PYTHONIOENCODING=utf-8
+set PYTHONUTF8=1
 
 :: ============================================================
 ::                 🤖 ZETA AI ASSISTANT
 :: ============================================================
 echo ╔══════════════════════════════════════════════════════════════╗
-echo ║                    🤖 Zeta AI Assistant v4.0               ║
+echo ║                    🤖 Zeta AI Assistant v7.5               ║
 echo ║              Создатель: Samriddin (Самир)                  ║
 echo ╚══════════════════════════════════════════════════════════════╝
 echo.
@@ -29,7 +32,6 @@ if errorlevel 1 (
     exit /b 1
 )
 
-:: Получаем версию Python
 for /f "tokens=2" %%i in ('python --version 2^>^&1') do set PYTHON_VER=%%i
 echo ✅ Python %PYTHON_VER% найден
 echo.
@@ -80,6 +82,18 @@ if errorlevel 1 (
     pip install edge-tts
 )
 
+python -c "import dotenv" >nul 2>&1
+if errorlevel 1 (
+    echo ⚠️ python-dotenv не установлен. Установка...
+    pip install python-dotenv
+)
+
+python -c "import psutil" >nul 2>&1
+if errorlevel 1 (
+    echo ⚠️ psutil не установлен. Установка...
+    pip install psutil
+)
+
 echo ✅ Зависимости проверены
 echo.
 
@@ -94,20 +108,33 @@ if errorlevel 1 (
     echo ⚠️ Ollama не запущена!
     echo.
     echo    Пробую запустить Ollama...
-    
-    :: Проверяем, существует ли ollama.exe
+
+    :: Ищем ollama.exe в стандартных местах
+    set "OLLAMA_PATH="
     if exist "C:\Users\samir\AppData\Local\Programs\Ollama\ollama.exe" (
-        start /B "" "C:\Users\samir\AppData\Local\Programs\Ollama\ollama.exe" serve
+        set "OLLAMA_PATH=C:\Users\samir\AppData\Local\Programs\Ollama\ollama.exe"
+    )
+    if not defined OLLAMA_PATH (
+        if exist "%LOCALAPPDATA%\Programs\Ollama\ollama.exe" (
+            set "OLLAMA_PATH=%LOCALAPPDATA%\Programs\Ollama\ollama.exe"
+        )
+    )
+    if not defined OLLAMA_PATH (
+        if exist "C:\Program Files\Ollama\ollama.exe" (
+            set "OLLAMA_PATH=C:\Program Files\Ollama\ollama.exe"
+        )
+    )
+
+    if defined OLLAMA_PATH (
+        start /B "" "%OLLAMA_PATH%" serve
         echo ⏳ Ожидание запуска Ollama...
         timeout /t 5 /nobreak >nul
-        
-        :: Проверяем ещё раз
+
         python -c "import requests; requests.get('http://localhost:11434/api/tags', timeout=2)" >nul 2>&1
         if errorlevel 1 (
             echo ⚠️ Ollama не запустилась автоматически.
             echo.
             echo    Запустите вручную в новом окне:
-            echo    cd D:\ollama_models
             echo    ollama serve
             echo.
             echo    ⚠️ Zeta запустится, но ИИ не будет работать!
@@ -124,8 +151,8 @@ if errorlevel 1 (
         echo    https://ollama.ai/
         echo.
         echo    После установки скачайте модели:
-        echo    ollama pull qwen2.5:7b
-        echo    ollama pull llava:latest
+        echo    ollama pull zeta-universal
+        echo    ollama pull llava:13b
         echo.
         choice /C YN /M "Продолжить запуск без Ollama"
         if errorlevel 2 exit /b 1
@@ -140,20 +167,51 @@ echo.
 :: ============================================================
 echo [5/6] 🧠 Проверка моделей...
 
-python -c "import requests; r=requests.get('http://localhost:11434/api/tags'); print('✅ Модели загружены' if r.json().get('models') else '⚠️ Моделей нет')" >nul 2>&1
-if errorlevel 1 (
-    echo ⚠️ Модели не найдены!
+set "HAS_ZETA="
+set "HAS_LLAVA="
+set "HAS_ANY="
+
+:: ollama list выводит таблицу, первая строка — заголовок
+:: skip=1 — пропускаем заголовок, tokens=1 — берём первое слово (имя модели)
+for /f "skip=1 tokens=1" %%m in ('ollama list 2^>nul') do (
+    if not "%%m"=="" (
+        set "HAS_ANY=1"
+        echo %%m | findstr /I "zeta-universal" >nul && set "HAS_ZETA=1"
+        echo %%m | findstr /I "llava" >nul && set "HAS_LLAVA=1"
+    )
+)
+
+if defined HAS_ANY (
+    if defined HAS_ZETA (
+        echo ✅ zeta-universal: найдена
+    ) else (
+        echo ⚠️ zeta-universal: НЕ найдена
+        echo    Установи: ollama pull zeta-universal
+    )
+
+    if defined HAS_LLAVA (
+        echo ✅ llava: найдена
+    ) else (
+        echo ⚠️ llava: НЕ найдена
+        echo    Установи: ollama pull llava:13b
+    )
+
+    if not defined HAS_ZETA (
+        echo.
+        choice /C YN /M "Продолжить без zeta-universal (ИИ не будет работать)"
+        if errorlevel 2 exit /b 1
+    )
+) else (
+    echo ⚠️ Модели не найдены в Ollama!
     echo.
-    echo    Установите основные модели:
-    echo    ollama pull qwen2.5:7b
-    echo    ollama pull llava:latest
+    echo    Установи основные модели:
+    echo    ollama pull zeta-universal
+    echo    ollama pull llava:13b
     echo.
-    echo    Это может занять 10-20 минут в зависимости от скорости интернета.
+    echo    Это может занять 10-20 минут.
     echo.
     choice /C YN /M "Продолжить запуск без моделей"
     if errorlevel 2 exit /b 1
-) else (
-    echo ✅ Модели проверены
 )
 echo.
 
@@ -166,19 +224,21 @@ echo ═════════════════════════
 echo    💡 Горячие клавиши:
 echo       Ctrl+Shift+Z  — Показать/скрыть виджет
 echo       Ctrl+Shift+S  — Статус системы
+echo       Ctrl+Shift+P  — Отправить фото
+echo       Ctrl+Shift+V  — Голосовой ввод
+echo       Ctrl+Shift+D  — Планировщик
+echo       Ctrl+Shift+A  — Автоматизация
+echo       Ctrl+Shift+N  — Устройства
 echo       Ctrl+L        — Очистить чат
-echo       Ctrl+P        — Режим программиста
 echo ══════════════════════════════════════════════════════════════
 echo.
 
-:: Запускаем Python с UTF-8
 python main.py
 
-:: Если Python завершился с ошибкой
 if errorlevel 1 (
     echo.
     echo ❌ Zeta завершилась с ошибкой.
-    echo    Проверьте файл data/zeta.log для подробностей.
+    echo    Проверь файл data/zeta.log для подробностей.
     echo.
     pause
 )

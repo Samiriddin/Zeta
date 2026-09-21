@@ -1,13 +1,26 @@
 # -*- coding: utf-8 -*-
 """
 Zeta — главный виджет.
-Чистый и минималистичный интерфейс: маленькие функциональные кнопки,
-большое пространство для чата, микрофон вместо скрепки, кнопка "Code".
+Чистый и минималистичный интерфейс + фото + голосовой ввод + Wake Word + Планировщик + Автоматизация + Устройства + Режим разработчика.
+Два режима голоса: обычный + диалоговый.
+Wake Word по умолчанию ВЫКЛЮЧЕН.
+
+ИСПРАВЛЕНО (2026-09-21):
+    - load_chat_history: НЕ удаляет историю из БД, читает последние 20 сообщений
+    - toggle_voice_input: блокирует ручной ввод во время диалогового режима
+    - ZetaWorker.run: speak() в отдельном daemon-потоке (не блокирует UI)
+    - apply_settings: обновляет размер виджета, если изменился в настройках
+    - _handle_wake_activation: проверка _voice_mode перед стартом диалога
+    - load_position: проверка границ экрана
+    - Кнопка "Чат" заменена на "Dev" (открывает ProgrammerWindow)
+    - Добавлен хоткей Ctrl+Shift+F для фокуса на поле ввода
 """
 
 import sys
 import os
 import html
+import threading
+from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
@@ -15,7 +28,8 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QFrame,
     QSystemTrayIcon, QMenu, QMessageBox, QScrollArea,
-    QInputDialog, QGraphicsDropShadowEffect, QSizePolicy
+    QInputDialog, QGraphicsDropShadowEffect, QSizePolicy,
+    QFileDialog
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRectF
 from PyQt6.QtGui import (
@@ -28,6 +42,37 @@ from core.memory import get_setting, save_setting, get_history, clear_history
 from voice.tts import speak
 from ui.settings import SettingsWindow
 from ui.programmer import ProgrammerWindow
+from ui.voice_menu import VoiceModeMenu
+from ui.scheduler_window import SchedulerWindow
+from ui.automation_window import AutomationWindow
+from ui.devices_window import DevicesWindow
+
+# === ОБРАБОТКА ИЗОБРАЖЕНИЙ ===
+try:
+    from modules.image_handler import get_image_handler, SUPPORTED_FORMATS
+    HAS_IMAGE_HANDLER = True
+except ImportError:
+    HAS_IMAGE_HANDLER = False
+    SUPPORTED_FORMATS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+    print("⚠️ Модуль image_handler не найден.")
+
+# === ГОЛОСОВОЙ ВВОД (STT) ===
+try:
+    from voice.stt import get_stt, HAS_SOUND
+    HAS_STT = HAS_SOUND
+except ImportError:
+    HAS_STT = False
+    get_stt = None
+    print("⚠️ Модуль STT не найден.")
+
+# === WAKE WORD ===
+try:
+    from voice.wake_word import get_wake_word, HAS_WAKEWORD
+    HAS_WAKE = HAS_WAKEWORD
+except ImportError:
+    HAS_WAKE = False
+    get_wake_word = None
+    print("⚠️ Модуль wake_word не найден.")
 
 
 # ========== РАЗМЕРЫ ==========
@@ -263,7 +308,7 @@ class MessageWidget(QFrame):
         self.updateGeometry()
 
 
-# ========== ПОТОК ZETA (ИСПРАВЛЕН) ==========
+# ========== ПОТОК ZETA ==========
 class ZetaWorker(QThread):
     chunk_ready = pyqtSignal(str)
     finished = pyqtSignal(str)
@@ -276,7 +321,7 @@ class ZetaWorker(QThread):
         self.mode = mode
         self._full = ""
         self._is_running = True
-        self._voice_enabled = False  # Добавляем флаг для озвучки
+        self._voice_enabled = False
 
     def set_voice_enabled(self, enabled: bool):
         self._voice_enabled = enabled
@@ -289,19 +334,22 @@ class ZetaWorker(QThread):
                     break
                 self._full += chunk
                 self.chunk_ready.emit(self._full)
-            
+
             self.thinking.emit(False)
-            
+
             if self._is_running:
-                # ✅ ОЗВУЧКА ПЕРЕМЕЩЕНА СЮДА, В ПОТОК!
-                # Теперь она не будет обрываться в интерфейсе, 
-                # а edge-tts получит ПОЛНЫЙ текст.
+                # ИСПРАВЛЕНО: speak() в отдельном потоке, чтобы не блокировать
                 if self._voice_enabled and self._full.strip():
-                    try:
-                        speak(self._full)
-                    except Exception:
-                        pass
-                
+                    full = self._full
+
+                    def _speak_async():
+                        try:
+                            speak(full)
+                        except Exception:
+                            pass
+
+                    threading.Thread(target=_speak_async, daemon=True).start()
+
                 self.finished.emit(self._full)
         except Exception as e:
             self.thinking.emit(False)
@@ -311,6 +359,90 @@ class ZetaWorker(QThread):
         self._is_running = False
 
 
+# ========== ПОТОК АНАЛИЗА ФОТО ==========
+class ImageWorker(QThread):
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, image_path: str, question: str = None):
+        super().__init__()
+        self.image_path = image_path
+        self.question = question
+
+    def run(self):
+        try:
+            if not HAS_IMAGE_HANDLER:
+                self.error.emit("⚠️ Модуль обработки изображений не найден.")
+                return
+
+            handler = get_image_handler()
+            ok, answer = handler.analyze_image(self.image_path, self.question)
+
+            if ok:
+                self.finished.emit(answer)
+            else:
+                self.error.emit(answer)
+        except Exception as e:
+            self.error.emit(f"⚠️ Ошибка анализа фото: {e}")
+
+
+# ========== ПОТОК ГОЛОСОВОГО ВВОДА ==========
+class VoiceWorker(QThread):
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, wav_path: str):
+        super().__init__()
+        self.wav_path = wav_path
+
+    def run(self):
+        try:
+            if not HAS_STT or get_stt is None:
+                self.error.emit("⚠️ STT не установлен.")
+                return
+
+            stt = get_stt()
+            text = stt.recognize_file(self.wav_path)
+
+            if text:
+                self.finished.emit(text)
+            else:
+                self.error.emit("⚠️ Речь не распознана. Попробуйте снова.")
+        except Exception as e:
+            self.error.emit(f"⚠️ Ошибка STT: {e}")
+
+
+# ========== ПОТОК ДИАЛОГОВОГО СЛУШАНИЯ ==========
+class DialogVoiceWorker(QThread):
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, max_duration: int = 30, silence_duration: float = 3.0):
+        super().__init__()
+        self.max_duration = max_duration
+        self.silence_duration = silence_duration
+
+    def run(self):
+        try:
+            if not HAS_STT or get_stt is None:
+                self.error.emit("⚠️ STT не установлен.")
+                return
+
+            stt = get_stt()
+            wav_path = stt.record_until_silence(
+                max_duration=self.max_duration,
+                silence_duration=self.silence_duration,
+                silence_threshold=500
+            )
+
+            if wav_path:
+                self.finished.emit(wav_path)
+            else:
+                self.finished.emit("")
+        except Exception as e:
+            self.error.emit(f"⚠️ Ошибка записи: {e}")
+
+
 # ========== ГЛАВНЫЙ WIDGET ==========
 class ZetaWidget(QWidget):
     def __init__(self):
@@ -318,10 +450,19 @@ class ZetaWidget(QWidget):
         self._drag_pos = None
         self.settings_window: Optional[SettingsWindow] = None
         self.programmer_window: Optional[ProgrammerWindow] = None
+        self.scheduler_window: Optional[SchedulerWindow] = None
+        self.automation_window: Optional[AutomationWindow] = None
+        self.devices_window: Optional[DevicesWindow] = None
         self.worker: Optional[ZetaWorker] = None
+        self.image_worker: Optional[ImageWorker] = None
+        self.voice_worker: Optional[VoiceWorker] = None
+        self.dialog_worker: Optional[DialogVoiceWorker] = None
         self._stream_message: Optional[MessageWidget] = None
         self._message_count = 0
         self._is_collapsed = False
+        self._is_recording = False
+        self._voice_mode = None
+        self._wake_enabled = False
         self._typing_dots = 0
         self._typing_timer = QTimer(self)
         self._typing_timer.timeout.connect(self._update_typing_animation)
@@ -335,9 +476,14 @@ class ZetaWidget(QWidget):
         self.setup_tray()
         self.apply_opacity()
 
+        self.setAcceptDrops(True)
+
         self._save_timer = QTimer(self)
         self._save_timer.timeout.connect(self.save_position)
         self._save_timer.start(30000)
+
+        if self._wake_enabled:
+            QTimer.singleShot(2000, self.start_wake_word)
 
     def _load_settings(self):
         self.theme_name = get_setting("theme", "dark")
@@ -350,6 +496,11 @@ class ZetaWidget(QWidget):
         except Exception:
             self.widget_opacity = 1.0
         self.auto_focus = get_setting("auto_focus", "true") == "true"
+
+        try:
+            self._wake_enabled = get_setting("wake_word_enabled", "false") == "true"
+        except Exception:
+            self._wake_enabled = False
 
     def init_ui(self):
         self.setWindowTitle("Zeta")
@@ -372,17 +523,14 @@ class ZetaWidget(QWidget):
         self.main_frame.setGeometry(0, 0, self.widget_width, self.widget_height)
 
         main_layout = QVBoxLayout(self.main_frame)
-        main_layout.setContentsMargins(24, 20, 24, 18)
-        main_layout.setSpacing(12)
+        main_layout.setContentsMargins(20, 14, 20, 14)
+        main_layout.setSpacing(8)
 
         main_layout.addLayout(self._create_header())
         self.section_bar = self._create_section_bar()
         main_layout.addWidget(self.section_bar)
-        self.search_bar = self._create_search_bar()
-        main_layout.addWidget(self.search_bar)
         main_layout.addWidget(self._create_date_divider())
 
-        # Чат
         self.chat_frame = QFrame()
         self.chat_frame.setObjectName("ChatFrame")
         self.chat_frame.setStyleSheet("""
@@ -393,7 +541,7 @@ class ZetaWidget(QWidget):
             }
         """)
         chat_layout = QVBoxLayout(self.chat_frame)
-        chat_layout.setContentsMargins(16, 16, 16, 12)
+        chat_layout.setContentsMargins(14, 14, 14, 10)
         self.chat_scroll = QScrollArea()
         self.chat_scroll.setWidgetResizable(True)
         self.chat_scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -415,7 +563,6 @@ class ZetaWidget(QWidget):
         chat_layout.addWidget(self.chat_scroll)
         main_layout.addWidget(self.chat_frame, 1)
 
-        # Печатает
         self.typing_label = QLabel("Zeta печатает...")
         self.typing_label.setStyleSheet("""
             QLabel { color: #6ebaff; font-size: 13px; padding-left: 8px; background: transparent; }
@@ -429,37 +576,37 @@ class ZetaWidget(QWidget):
     # ========== HEADER ==========
     def _create_header(self):
         layout = QHBoxLayout()
-        layout.setSpacing(14)
+        layout.setSpacing(12)
 
         logo = QFrame()
-        logo.setFixedSize(56, 56)
+        logo.setFixedSize(50, 50)
         logo.setStyleSheet("""
             QFrame {
                 background-color: #2937e8;
                 border: 1px solid #6674ff;
-                border-radius: 16px;
+                border-radius: 14px;
             }
         """)
         logo_layout = QVBoxLayout(logo)
         logo_label = QLabel("Z")
         logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        logo_label.setStyleSheet("color: white; font-size: 32px; font-weight: 800; background: transparent;")
+        logo_label.setStyleSheet("color: white; font-size: 28px; font-weight: 800; background: transparent;")
         logo_layout.addWidget(logo_label)
         layout.addWidget(logo)
 
         divider = QFrame()
         divider.setFixedWidth(1)
-        divider.setFixedHeight(40)
+        divider.setFixedHeight(36)
         divider.setStyleSheet("background-color: #304267;")
         layout.addWidget(divider)
 
         name_layout = QVBoxLayout()
         name_layout.setSpacing(1)
         title = QLabel("Zeta")
-        title.setStyleSheet("color: #f6f7ff; font-size: 28px; font-weight: 700; background: transparent;")
+        title.setStyleSheet("color: #f6f7ff; font-size: 24px; font-weight: 700; background: transparent;")
         name_layout.addWidget(title)
         status = QLabel("●  Онлайн")
-        status.setStyleSheet("color: #39f4a8; font-size: 14px; background: transparent;")
+        status.setStyleSheet("color: #39f4a8; font-size: 12px; background: transparent;")
         name_layout.addWidget(status)
         layout.addLayout(name_layout)
 
@@ -481,15 +628,15 @@ class ZetaWidget(QWidget):
 
     def _window_button(self, text, tooltip, danger=False):
         button = QPushButton(text)
-        button.setFixedSize(38, 38)
+        button.setFixedSize(34, 34)
         color = "#ff6c95" if danger else "#c5cee9"
         button.setStyleSheet(f"""
             QPushButton {{
                 background: transparent;
                 border: none;
                 color: {color};
-                font-size: 22px;
-                border-radius: 10px;
+                font-size: 20px;
+                border-radius: 9px;
             }}
             QPushButton:hover {{
                 background-color: rgba(100,120,220,0.15);
@@ -499,91 +646,82 @@ class ZetaWidget(QWidget):
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         return button
 
-    # ========== SECTION BAR (уменьшена) ==========
+    # ========== SECTION BAR ==========
     def _create_section_bar(self):
         frame = QFrame()
-        frame.setFixedHeight(70)
         frame.setStyleSheet("""
             QFrame {
                 background-color: #071124;
                 border: 1px solid #223866;
-                border-radius: 18px;
+                border-radius: 16px;
             }
         """)
-        layout = QHBoxLayout(frame)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
 
+        outer = QVBoxLayout(frame)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(6)
+
+        # ИСПРАВЛЕНО: 💬 Чат → 💻 Dev (открывает Режим разработчика)
         sections = [
-            ("💬", "Чат", self.focus_chat),
-            ("📷", "Камера", self.take_screenshot),
+            ("💻", "Dev",    self.open_programmer_mode),
+            ("📷", "Фото",   self.open_photo),
+            ("🖥️", "Экран", self.take_screenshot),
             ("🧠", "Память", self.show_facts),
-            ("📁", "Файлы", self.open_explorer),
-            ("⏰", "Будильник", self.set_reminder),
-            ("💻", "Code", self.open_programmer_mode),
+            ("📁", "Файлы",  self.open_explorer),
+            ("📅", "План",   self.open_scheduler),
+            ("🤖", "Авто",   self.open_automation),
+            ("🌐", "Сеть",   self.open_devices),
+            ("⏰", "Буд.",   self.set_reminder),
+            ("🎯", "Wake",   self.toggle_wake_word),
         ]
 
-        for icon, name, callback in sections:
+        row1 = QHBoxLayout()
+        row1.setSpacing(6)
+        row2 = QHBoxLayout()
+        row2.setSpacing(6)
+
+        for idx, (icon, name, callback) in enumerate(sections):
             button = QPushButton()
             button.setCursor(Qt.CursorShape.PointingHandCursor)
-            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            button.setFixedHeight(46)
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             button.setText(f"{icon}\n{name}")
             button.setStyleSheet("""
                 QPushButton {
                     background-color: #101b35;
-                    border: none;
-                    border-radius: 12px;
+                    border: 1px solid #1c2c54;
+                    border-radius: 10px;
                     color: #dbe2f7;
-                    font-size: 13px;
-                    padding: 4px;
+                    font-size: 10px;
+                    font-weight: 600;
+                    padding: 2px;
+                    text-align: center;
                 }
                 QPushButton:hover {
                     background-color: #172755;
+                    border: 1px solid #3a5bb8;
                     color: white;
+                }
+                QPushButton:pressed {
+                    background-color: #0c1428;
                 }
             """)
             button.clicked.connect(callback)
-            layout.addWidget(button)
 
-        return frame
+            if idx < 5:
+                row1.addWidget(button)
+            else:
+                row2.addWidget(button)
 
-    # ========== SEARCH ==========
-    def _create_search_bar(self):
-        frame = QFrame()
-        frame.setFixedHeight(54)
-        frame.setStyleSheet("""
-            QFrame {
-                background-color: #071124;
-                border: 1px solid #31417b;
-                border-radius: 18px;
-            }
-        """)
-        layout = QHBoxLayout(frame)
-        layout.setContentsMargins(16, 6, 16, 6)
+        outer.addLayout(row1)
+        outer.addLayout(row2)
 
-        icon = QLabel("⌕")
-        icon.setStyleSheet("color: #37a5ff; font-size: 26px; background: transparent; border: none;")
-        layout.addWidget(icon)
-
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Поиск в чате...")
-        self.search_input.setStyleSheet("""
-            QLineEdit {
-                background: transparent;
-                color: #edf1ff;
-                border: none;
-                font-size: 16px;
-                padding: 4px;
-            }
-        """)
-        self.search_input.returnPressed.connect(self.search_in_chat)
-        layout.addWidget(self.search_input)
         return frame
 
     # ========== DATE ==========
     def _create_date_divider(self):
         frame = QFrame()
-        frame.setFixedHeight(36)
+        frame.setFixedHeight(26)
         layout = QHBoxLayout(frame)
         layout.setContentsMargins(0, 0, 0, 0)
 
@@ -596,15 +734,15 @@ class ZetaWidget(QWidget):
 
         pill = QLabel("Сегодня")
         pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        pill.setFixedWidth(100)
+        pill.setFixedWidth(88)
         pill.setStyleSheet("""
             QLabel {
                 color: #dbe2ff;
                 background-color: #0a1428;
                 border: 1px solid #273c6d;
-                border-radius: 14px;
-                font-size: 14px;
-                padding: 4px 12px;
+                border-radius: 12px;
+                font-size: 12px;
+                padding: 1px 8px;
             }
         """)
         layout.addWidget(line_left, 1)
@@ -618,33 +756,39 @@ class ZetaWidget(QWidget):
         layout.setSpacing(8)
 
         frame = QFrame()
-        frame.setFixedHeight(60)
+        frame.setFixedHeight(54)
         frame.setStyleSheet("""
             QFrame {
                 background-color: #09142a;
                 border: 1px solid #3858b1;
-                border-radius: 20px;
+                border-radius: 18px;
             }
         """)
         inner = QHBoxLayout(frame)
-        inner.setContentsMargins(10, 8, 8, 8)
-        inner.setSpacing(8)
+        inner.setContentsMargins(8, 6, 6, 6)
+        inner.setSpacing(6)
 
-        # Микрофон
-        self.attach_btn = QPushButton("🎤")
-        self.attach_btn.setFixedSize(36, 36)
+        self.attach_btn = QPushButton("📎")
+        self.attach_btn.setFixedSize(34, 34)
         self.attach_btn.setStyleSheet("""
             QPushButton {
                 background: transparent;
                 color: #8b96b6;
                 border: none;
-                font-size: 20px;
+                font-size: 17px;
             }
             QPushButton:hover { color: #45aaff; }
         """)
-        self.attach_btn.setToolTip("Голосовой ввод (скоро)")
-        self.attach_btn.clicked.connect(self._toggle_microphone)
+        self.attach_btn.setToolTip("Прикрепить фото")
+        self.attach_btn.clicked.connect(self.open_photo)
         inner.addWidget(self.attach_btn)
+
+        self.mic_btn = QPushButton("🎤")
+        self.mic_btn.setFixedSize(34, 34)
+        self.mic_btn.setStyleSheet(self._mic_btn_style(False))
+        self.mic_btn.setToolTip("Голосовой ввод")
+        self.mic_btn.clicked.connect(self.toggle_voice_input)
+        inner.addWidget(self.mic_btn)
 
         self.input_field = QLineEdit()
         self.input_field.setPlaceholderText("Напиши что-нибудь...")
@@ -653,22 +797,22 @@ class ZetaWidget(QWidget):
                 background: transparent;
                 color: #f3f5ff;
                 border: none;
-                font-size: 16px;
+                font-size: 15px;
             }
         """)
         self.input_field.returnPressed.connect(self.send_message)
         inner.addWidget(self.input_field)
 
         self.send_btn = QPushButton("➤")
-        self.send_btn.setFixedSize(46, 46)
+        self.send_btn.setFixedSize(42, 42)
         self.send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.send_btn.setStyleSheet("""
             QPushButton {
                 background-color: #4935e8;
                 border: 1px solid #735dff;
-                border-radius: 23px;
+                border-radius: 21px;
                 color: white;
-                font-size: 22px;
+                font-size: 20px;
                 font-weight: bold;
             }
             QPushButton:hover { background-color: #634cff; }
@@ -684,36 +828,68 @@ class ZetaWidget(QWidget):
         layout.addWidget(frame)
         return layout
 
+    def _mic_btn_style(self, recording: bool):
+        if recording:
+            return """
+                QPushButton {
+                    background: transparent;
+                    color: #ff5d83;
+                    border: none;
+                    font-size: 20px;
+                }
+                QPushButton:hover { color: #ff7a9a; }
+            """
+        return """
+            QPushButton {
+                background: transparent;
+                color: #8b96b6;
+                border: none;
+                font-size: 17px;
+            }
+            QPushButton:hover { color: #45aaff; }
+        """
+
+    def _mic_btn_style_dialog(self):
+        return """
+            QPushButton {
+                background: transparent;
+                color: #89b4fa;
+                border: none;
+                font-size: 18px;
+            }
+            QPushButton:hover { color: #a8c7ff; }
+        """
+
     # ========== FOOTER ==========
     def _create_status_bar(self):
         bar = QFrame()
-        bar.setFixedHeight(30)
+        bar.setFixedHeight(26)
         bar.setStyleSheet("background: transparent; border: none;")
         layout = QHBoxLayout(bar)
-        layout.setContentsMargins(8, 0, 8, 0)
+        layout.setContentsMargins(6, 0, 6, 0)
 
         self.status_info = QLabel("✓  Готов")
-        self.status_info.setStyleSheet("color: #45eeb0; font-size: 14px; background: transparent;")
+        self.status_info.setStyleSheet("color: #45eeb0; font-size: 13px; background: transparent;")
         layout.addWidget(self.status_info)
         layout.addStretch()
 
         self.msg_count_label = QLabel("💬 0")
-        self.msg_count_label.setStyleSheet("color: #d4b3ff; font-size: 14px; background: transparent;")
+        self.msg_count_label.setStyleSheet("color: #d4b3ff; font-size: 13px; background: transparent;")
         layout.addWidget(self.msg_count_label)
 
         separator = QFrame()
-        separator.setFixedSize(1, 20)
+        separator.setFixedSize(1, 18)
         separator.setStyleSheet("background-color: #334268;")
         layout.addWidget(separator)
 
         self.voice_toggle_btn = QPushButton("🔊" if self.voice_enabled else "🔇")
-        self.voice_toggle_btn.setFixedSize(36, 28)
+        self.voice_toggle_btn.setFixedSize(32, 24)
         self.voice_toggle_btn.setStyleSheet("""
             QPushButton {
                 background: transparent;
                 color: #cbd4ef;
                 border: none;
-                font-size: 18px;
+                font-size: 16px;
             }
             QPushButton:hover { color: #6bb8ff; }
         """)
@@ -742,12 +918,40 @@ class ZetaWidget(QWidget):
         scrollbar.setValue(scrollbar.maximum())
 
     def load_chat_history(self):
-        # ЧИСТИМ ИСТОРИЮ ПЕРЕД ЗАГРУЗКОЙ, ЧТОБЫ НЕ БЫЛО ДУБЛИКАТОВ
-        clear_history()  # Удаляем все старые сообщения из БД
-
+        """
+        ИСПРАВЛЕНО: НЕ удаляем историю из БД.
+        Читаем последние 20 сообщений и выводим их.
+        Если истории нет — показываем приветствие.
+        """
         self.chat_layout.addStretch()
-        # Показываем только ОДНО приветствие
-        self._insert_message("Zeta", "Привет! Я Zeta. Чем могу помочь? 😊")
+
+        history = []
+        try:
+            history = get_history(limit=20)
+        except Exception as e:
+            print(f"⚠️ Не удалось загрузить историю: {e}")
+
+        if history:
+            for msg in history:
+                role = "Zeta" if msg.get("role") == "assistant" else "Вы"
+                content = msg.get("content", "")
+                if content.strip():
+                    self._insert_message(role, content)
+            self._message_count = len(history)
+            self.msg_count_label.setText(f"💬 {self._message_count}")
+        else:
+            self._insert_message(
+                "Zeta",
+                "Привет! Я Zeta. Чем могу помочь? 😊\n\n"
+                "💡 Кнопки:\n"
+                "   💻 Dev — режим разработчика\n"
+                "   📅 План — задачи, встречи, рутины\n"
+                "   🤖 Авто — автоматизация\n"
+                "   🌐 Сеть — управление устройствами\n"
+                "   🎤 — выбор голосового режима\n"
+                "   🎯 Wake — активация по слову"
+            )
+
         self._set_status("✓  Готов", "success")
 
     # ========== STREAMING ==========
@@ -755,6 +959,13 @@ class ZetaWidget(QWidget):
         text = self.input_field.text().strip()
         if not text:
             return
+
+        if self._wake_enabled:
+            try:
+                ww = get_wake_word()
+                ww.pause()
+            except Exception:
+                pass
 
         self.input_field.clear()
         self._insert_message("Вы", text)
@@ -768,9 +979,8 @@ class ZetaWidget(QWidget):
         self._set_status("⏳  Z думает...", "warning")
 
         self.worker = ZetaWorker(text)
-        # Передаем настройку озвучки в поток
-        self.worker.set_voice_enabled(self.voice_enabled) 
-        
+        self.worker.set_voice_enabled(self.voice_enabled)
+
         self.worker.chunk_ready.connect(self._on_chunk)
         self.worker.finished.connect(self._on_finished)
         self.worker.error.connect(self._on_error)
@@ -788,8 +998,17 @@ class ZetaWidget(QWidget):
         self.send_btn.setEnabled(True)
         self.send_btn.setText("➤")
         self._set_status("✓  Готов", "success")
-        # ✅ ОЗВУЧКА УБРАНА ИЗ ЭТОГО МЕСТА! Она теперь вызывается в потоке ZetaWorker!
         self._stream_message = None
+
+        if self._wake_enabled:
+            try:
+                ww = get_wake_word()
+                ww.resume()
+            except Exception:
+                pass
+
+        if self._voice_mode == "dialog":
+            self._schedule_dialog_listen()
 
     def _on_error(self, error_msg: str):
         self._typing_timer.stop()
@@ -814,26 +1033,386 @@ class ZetaWidget(QWidget):
         dots = "." * self._typing_dots
         self.typing_label.setText(f"Zeta печатает{dots}")
 
-    # ========== SEARCH ==========
-    def search_in_chat(self):
-        query = self.search_input.text().strip().lower()
-        if not query:
+    # ========== ФОТО ==========
+    def open_photo(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выбери изображение",
+            "",
+            "Изображения (*.png *.jpg *.jpeg *.gif *.bmp *.webp)"
+        )
+        if not path:
+            return
+        self.analyze_photo(path)
+
+    def analyze_photo(self, path: str, question: str = None):
+        if not HAS_IMAGE_HANDLER:
+            self._insert_message("Zeta", "⚠️ Модуль обработки изображений не установлен.")
             return
 
-        found = False
-        for message in self._messages:
-            if query in message.message_text.lower():
-                message.setStyleSheet("background-color: rgba(55,150,255,0.10);")
-                found = True
-                self.chat_scroll.ensureWidgetVisible(message, 30, 30)
-                break
-            else:
-                message.setStyleSheet("")
+        file_name = Path(path).name
+        self._insert_message("Вы", f"📷 Отправлено фото: {file_name}")
 
-        if found:
-            self._set_status(f"🔎  Найдено: {query}", "info")
+        self._set_status(f"📸  Смотрю на фото...", "info")
+        self.typing_label.setText("Zeta смотрит на фото...")
+        self.typing_label.show()
+        self._typing_timer.stop()
+
+        self._stream_message = self._insert_message("Zeta", "🖼️ Анализирую...")
+
+        self.image_worker = ImageWorker(path, question)
+        self.image_worker.finished.connect(self._on_photo_finished)
+        self.image_worker.error.connect(self._on_photo_error)
+        self.image_worker.start()
+
+    def _on_photo_finished(self, answer: str):
+        self.typing_label.hide()
+        self._set_status("✓  Готово", "success")
+        if self._stream_message:
+            self._stream_message.setText(f"🖼️ {answer}")
+            self._stream_message = None
+
+        if self.voice_enabled and answer.strip():
+            def speak_async():
+                try:
+                    speak(answer)
+                except Exception:
+                    pass
+            threading.Thread(target=speak_async, daemon=True).start()
+
+    def _on_photo_error(self, error: str):
+        self.typing_label.hide()
+        self._set_status("⚠️  Ошибка", "danger")
+        if self._stream_message:
+            self._stream_message.setText(error)
+            self._stream_message = None
+
+    # ========== WAKE WORD ==========
+    def toggle_wake_word(self):
+        if not HAS_WAKE:
+            self._insert_message(
+                "Zeta",
+                "⚠️ Wake Word не установлен.\n\n"
+                "Установите:\n"
+                "pip install openwakeword onnxruntime"
+            )
+            self._set_status("⚠️  Wake Word не установлен", "warning")
+            return
+
+        if self._wake_enabled:
+            self.stop_wake_word()
         else:
-            self._set_status(f"✕  Не найдено: {query}", "warning")
+            self.start_wake_word()
+
+    def start_wake_word(self):
+        if self._wake_enabled:
+            return
+
+        ww = get_wake_word()
+        if not ww.start(self._on_wake_word_detected, threshold=0.5):
+            self._insert_message(
+                "Zeta",
+                "⚠️ Не удалось запустить Wake Word.\n"
+                "Проверьте микрофон."
+            )
+            self._set_status("⚠️  Ошибка Wake Word", "danger")
+            return
+
+        self._wake_enabled = True
+        save_setting("wake_word_enabled", "true")
+
+        self._insert_message(
+            "Zeta",
+            "🎯 **Wake Word включён**\n"
+            "Скажи «Hey Jarvis» — активируюсь."
+        )
+        self._set_status("🎯  Wake Word слушает...", "info")
+
+    def stop_wake_word(self):
+        if not self._wake_enabled:
+            return
+
+        ww = get_wake_word()
+        ww.stop()
+
+        self._wake_enabled = False
+        save_setting("wake_word_enabled", "false")
+
+        self._insert_message("Zeta", "🎯 Wake Word выключен.")
+        self._set_status("✓  Готов", "success")
+
+    def _on_wake_word_detected(self, name: str, score: float):
+        QTimer.singleShot(0, lambda: self._handle_wake_activation(name, score))
+
+    def _handle_wake_activation(self, name: str, score: float):
+        """
+        ИСПРАВЛЕНО: если уже в диалоговом режиме — не запускаем заново.
+        """
+        if self._voice_mode == "dialog":
+            return
+
+        self._insert_message("Zeta", "🎯 Услышала активацию! Говорите...")
+        self._set_status("🎯  Слушаю...", "info")
+        QTimer.singleShot(500, self.start_dialog_mode)
+
+    # ========== ПЛАНИРОВЩИК ==========
+    def open_scheduler(self):
+        if self.scheduler_window is None or not self.scheduler_window.isVisible():
+            self.scheduler_window = SchedulerWindow(self)
+
+        self.scheduler_window.show()
+        self.scheduler_window.raise_()
+        self.scheduler_window.activateWindow()
+
+    # ========== АВТОМАТИЗАЦИЯ ==========
+    def open_automation(self):
+        if self.automation_window is None or not self.automation_window.isVisible():
+            self.automation_window = AutomationWindow(self)
+
+        self.automation_window.show()
+        self.automation_window.raise_()
+        self.automation_window.activateWindow()
+
+    # ========== УСТРОЙСТВА ==========
+    def open_devices(self):
+        if self.devices_window is None or not self.devices_window.isVisible():
+            self.devices_window = DevicesWindow(self)
+
+        self.devices_window.show()
+        self.devices_window.raise_()
+        self.devices_window.activateWindow()
+
+    # ========== ГОЛОСОВОЙ ВВОД (STT) ==========
+    def toggle_voice_input(self):
+        """
+        ИСПРАВЛЕНО: если активен диалоговый режим — корректно выходим и не запускаем меню.
+        """
+        if not HAS_STT:
+            self._insert_message(
+                "Zeta",
+                "⚠️ Голосовой ввод не установлен.\n\n"
+                "Установите:\n"
+                "pip install sounddevice soundfile numpy SpeechRecognition"
+            )
+            self._set_status("⚠️  STT не установлен", "warning")
+            return
+
+        if self._voice_mode == "dialog":
+            self._exit_dialog_mode("Кнопка 🎤")
+            return
+
+        if self._is_recording:
+            self.stop_voice_input()
+            return
+
+        self.show_voice_menu()
+
+    def show_voice_menu(self):
+        menu = VoiceModeMenu(current_mode=self._voice_mode, parent=self)
+        menu.mode_selected.connect(self._on_voice_mode_selected)
+        menu.exec()
+
+    def _on_voice_mode_selected(self, mode: str):
+        self._voice_mode = mode
+
+        if mode == "normal":
+            self._set_status("🎤  Обычный режим", "info")
+            self.start_normal_recording()
+        elif mode == "dialog":
+            self._set_status("🔄  Диалоговый режим", "info")
+            self.start_dialog_mode()
+
+    def start_normal_recording(self):
+        if self._is_recording:
+            return
+
+        try:
+            stt = get_stt()
+            if not stt.start_recording():
+                self._insert_message("Zeta", "⚠️ Не удалось начать запись.")
+                return
+        except Exception as e:
+            self._insert_message("Zeta", f"⚠️ Ошибка: {e}")
+            return
+
+        self._is_recording = True
+        self.mic_btn.setText("⏹️")
+        self.mic_btn.setStyleSheet(self._mic_btn_style(True))
+        self._set_status("🎤  Говорите... Нажми 🎤 чтобы остановить", "warning")
+
+    def start_dialog_mode(self):
+        """
+        ИСПРАВЛЕНО: проверка, что диалог не запущен уже.
+        """
+        if self._voice_mode == "dialog":
+            return
+
+        self._voice_mode = "dialog"
+        self.mic_btn.setText("🔄")
+        self.mic_btn.setStyleSheet(self._mic_btn_style_dialog())
+        self._insert_message(
+            "Zeta",
+            "🔄 **Диалоговый режим включён**\n"
+            "Говорите — я слушаю. Молчание 3 сек = выход."
+        )
+        self._start_dialog_listening()
+
+    def _start_dialog_listening(self):
+        if self._voice_mode != "dialog":
+            return
+
+        self._set_status("🟢  Слушаю...", "info")
+        self._is_recording = True
+
+        self.dialog_worker = DialogVoiceWorker(
+            max_duration=30,
+            silence_duration=3.0
+        )
+        self.dialog_worker.finished.connect(self._on_dialog_recorded)
+        self.dialog_worker.error.connect(self._on_dialog_error)
+        self.dialog_worker.start()
+
+    def _on_dialog_recorded(self, wav_path: str):
+        self._is_recording = False
+
+        if self._voice_mode != "dialog":
+            return
+
+        if not wav_path:
+            self._exit_dialog_mode("Тишина")
+            return
+
+        self._set_status("🔄  Распознаю...", "info")
+
+        self.voice_worker = VoiceWorker(wav_path)
+        self.voice_worker.finished.connect(self._on_dialog_voice_result)
+        self.voice_worker.error.connect(self._on_dialog_voice_error)
+        self.voice_worker.start()
+
+    def _on_dialog_voice_result(self, text: str):
+        if self._voice_mode != "dialog":
+            return
+
+        if text:
+            self._insert_message("Вы", f"🎤 {text}")
+            self.input_field.setText(text)
+            self.send_message()
+        else:
+            self._exit_dialog_mode("Не распознано")
+
+    def _on_dialog_voice_error(self, error: str):
+        if self._voice_mode != "dialog":
+            return
+        self._insert_message("Zeta", error)
+        self._exit_dialog_mode("Ошибка")
+
+    def _on_dialog_error(self, error: str):
+        if self._voice_mode != "dialog":
+            return
+        self._insert_message("Zeta", error)
+        self._exit_dialog_mode("Ошибка")
+
+    def _schedule_dialog_listen(self):
+        if self._voice_mode != "dialog":
+            return
+        QTimer.singleShot(2000, self._start_dialog_listening)
+
+    def _exit_dialog_mode(self, reason: str = ""):
+        if self._voice_mode != "dialog":
+            return
+
+        self._voice_mode = None
+        self._is_recording = False
+        self.mic_btn.setText("🎤")
+        self.mic_btn.setStyleSheet(self._mic_btn_style(False))
+
+        msg = "🔄 Диалог завершён"
+        if reason:
+            msg += f" ({reason})"
+
+        self._set_status("✓  Готов", "success")
+        self._insert_message("Zeta", msg)
+
+    def stop_voice_input(self):
+        if not self._is_recording:
+            return
+
+        if self._voice_mode == "dialog":
+            self._exit_dialog_mode("Вручную")
+            return
+
+        self._is_recording = False
+        self.mic_btn.setText("⏳")
+        self.mic_btn.setEnabled(False)
+        self._set_status("🔄  Распознаю...", "info")
+
+        try:
+            stt = get_stt()
+            wav_path = stt.stop_recording()
+        except Exception as e:
+            self._insert_message("Zeta", f"⚠️ Ошибка: {e}")
+            self._reset_mic_btn()
+            return
+
+        if not wav_path:
+            self._insert_message("Zeta", "⚠️ Не удалось сохранить запись.")
+            self._reset_mic_btn()
+            return
+
+        self.voice_worker = VoiceWorker(wav_path)
+        self.voice_worker.finished.connect(self._on_voice_result)
+        self.voice_worker.error.connect(self._on_voice_error)
+        self.voice_worker.start()
+
+    def _reset_mic_btn(self):
+        self._is_recording = False
+        self._voice_mode = None
+        self.mic_btn.setText("🎤")
+        self.mic_btn.setEnabled(True)
+        self.mic_btn.setStyleSheet(self._mic_btn_style(False))
+
+    def _on_voice_result(self, text: str):
+        self._reset_mic_btn()
+
+        if text:
+            self._set_status(f"✅  Распознано", "success")
+            self._insert_message("Вы", f"🎤 {text}")
+            self.input_field.setText(text)
+            self.send_message()
+        else:
+            self._set_status("⚠️  Не распознано", "warning")
+
+    def _on_voice_error(self, error: str):
+        self._reset_mic_btn()
+        self._set_status("⚠️  Ошибка STT", "danger")
+        self._insert_message("Zeta", error)
+
+    # ========== DRAG-AND-DROP ==========
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            for url in urls:
+                if url.isLocalFile():
+                    ext = Path(url.toLocalFile()).suffix.lower()
+                    if ext in SUPPORTED_FORMATS:
+                        event.acceptProposedAction()
+                        self._set_status("📷  Отпусти для анализа", "info")
+                        return
+        event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self._set_status("✓  Готов", "success")
+
+    def dropEvent(self, event):
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                path = url.toLocalFile()
+                ext = Path(path).suffix.lower()
+                if ext in SUPPORTED_FORMATS:
+                    event.acceptProposedAction()
+                    self.analyze_photo(path)
+                    return
+        self._set_status("⚠️  Неподдерживаемый файл", "warning")
 
     # ========== STATUS ==========
     def _set_status(self, text: str, level: str = "info"):
@@ -845,7 +1424,7 @@ class ZetaWidget(QWidget):
         }
         color = colors.get(level, "#8d98b8")
         self.status_info.setText(text)
-        self.status_info.setStyleSheet(f"color: {color}; font-size: 14px; background: transparent;")
+        self.status_info.setStyleSheet(f"color: {color}; font-size: 13px; background: transparent;")
 
     # ========== FUNCTIONS ==========
     def focus_chat(self):
@@ -905,30 +1484,27 @@ class ZetaWidget(QWidget):
         self.voice_toggle_btn.setText("🔊" if self.voice_enabled else "🔇")
         self._set_status("🔊  Голос включён" if self.voice_enabled else "🔇  Голос выключен", "info")
 
-    def _toggle_microphone(self):
-        self._set_status("🎤  Голосовой ввод скоро появится!", "warning")
-
     # ========== COLLAPSE ==========
     def toggle_collapse(self):
         self._is_collapsed = not self._is_collapsed
         if self._is_collapsed:
             self.setFixedHeight(120)
             self.section_bar.hide()
-            self.search_bar.hide()
             self.chat_frame.hide()
             self.typing_label.hide()
             self.input_field.hide()
             self.send_btn.hide()
             self.attach_btn.hide()
+            self.mic_btn.hide()
             self.collapse_btn.setText("+")
         else:
             self.setFixedHeight(self.widget_height)
             self.section_bar.show()
-            self.search_bar.show()
             self.chat_frame.show()
             self.input_field.show()
             self.send_btn.show()
             self.attach_btn.show()
+            self.mic_btn.show()
             self.collapse_btn.setText("−")
 
     # ========== SETTINGS ==========
@@ -941,19 +1517,31 @@ class ZetaWidget(QWidget):
         self.settings_window.activateWindow()
 
     def apply_settings(self):
+        """
+        ИСПРАВЛЕНО: обновляем размер виджета, если пользователь поменял в настройках.
+        """
         self.voice_enabled = get_setting("voice_enabled", "true") == "true"
         try:
             self.widget_opacity = float(get_setting("widget_opacity", "1.0"))
         except Exception:
             self.widget_opacity = 1.0
+
+        size_key = get_setting("widget_size", "M")
+        new_w, new_h = SIZE_MAP.get(size_key, SIZE_MAP["M"])
+        if (new_w, new_h) != (self.widget_width, self.widget_height):
+            self.widget_width, self.widget_height = new_w, new_h
+            self.setFixedSize(new_w, new_h)
+            self.main_frame.setGeometry(0, 0, new_w, new_h)
+
         self.apply_opacity()
         self.voice_toggle_btn.setText("🔊" if self.voice_enabled else "🔇")
 
     def apply_opacity(self):
         self.setWindowOpacity(self.widget_opacity)
 
-    # ========== PROGRAMMER MODE ==========
+    # ========== PROGRAMMER MODE (он же DEV) ==========
     def open_programmer_mode(self):
+        """Открыть окно режима разработчика (ProgrammerWindow)."""
         if self.programmer_window is None or not self.programmer_window.isVisible():
             self.programmer_window = ProgrammerWindow(self.theme_name)
             self.programmer_window.show()
@@ -966,6 +1554,14 @@ class ZetaWidget(QWidget):
         shortcuts = [
             ("Ctrl+Shift+Z", self.show_and_focus),
             ("Ctrl+Shift+S", self.show_system_status),
+            ("Ctrl+Shift+P", self.open_photo),
+            ("Ctrl+Shift+V", self.toggle_voice_input),
+            ("Ctrl+Shift+W", self.toggle_wake_word),
+            ("Ctrl+Shift+D", self.open_scheduler),
+            ("Ctrl+Shift+A", self.open_automation),
+            ("Ctrl+Shift+N", self.open_devices),
+            ("Ctrl+Shift+F", self.focus_chat),          # ← НОВЫЙ: фокус на чат
+            ("Ctrl+Shift+X", self.open_programmer_mode), # ← НОВЫЙ: режим разработчика
             ("Ctrl+L", self.clear_chat),
             ("Ctrl+W", self.close),
             ("Ctrl+Shift+O", self.open_settings),
@@ -995,6 +1591,12 @@ class ZetaWidget(QWidget):
         self._message_count = 0
         self.msg_count_label.setText("💬 0")
         self.chat_layout.addStretch()
+
+        try:
+            clear_history()
+        except Exception:
+            pass
+
         self._insert_message("Zeta", "Привет! Я Zeta. Чем могу помочь? 😊")
         self._set_status("🗑️  Чат очищен", "warning")
 
@@ -1025,7 +1627,26 @@ class ZetaWidget(QWidget):
             status_action = QAction("📊 Статус", self)
             status_action.triggered.connect(self.show_system_status)
             menu.addAction(status_action)
-            programmer_action = QAction("💻 Режим программиста", self)
+            photo_action = QAction("📷 Отправить фото", self)
+            photo_action.triggered.connect(self.open_photo)
+            menu.addAction(photo_action)
+            voice_action = QAction("🎤 Голосовой ввод", self)
+            voice_action.triggered.connect(self.toggle_voice_input)
+            menu.addAction(voice_action)
+            wake_action = QAction("🎯 Wake Word", self)
+            wake_action.triggered.connect(self.toggle_wake_word)
+            menu.addAction(wake_action)
+            plan_action = QAction("📅 Планировщик", self)
+            plan_action.triggered.connect(self.open_scheduler)
+            menu.addAction(plan_action)
+            auto_action = QAction("🤖 Автоматизация", self)
+            auto_action.triggered.connect(self.open_automation)
+            menu.addAction(auto_action)
+            devices_action = QAction("🌐 Устройства", self)
+            devices_action.triggered.connect(self.open_devices)
+            menu.addAction(devices_action)
+            # ИСПРАВЛЕНО: "Режим программиста" → "Режим разработчика"
+            programmer_action = QAction("💻 Режим разработчика", self)
             programmer_action.triggered.connect(self.open_programmer_mode)
             menu.addAction(programmer_action)
             menu.addSeparator()
@@ -1061,7 +1682,18 @@ class ZetaWidget(QWidget):
         try:
             x = int(get_setting("widget_x", ""))
             y = int(get_setting("widget_y", ""))
-            self.move(x, y)
+
+            screen = QApplication.primaryScreen().availableGeometry()
+
+            in_bounds = (
+                screen.left() <= x <= screen.right() - self.widget_width and
+                screen.top() <= y <= screen.bottom() - self.widget_height
+            )
+
+            if in_bounds:
+                self.move(x, y)
+            else:
+                self.position_widget()
         except (ValueError, TypeError):
             self.position_widget()
 
@@ -1091,7 +1723,23 @@ class ZetaWidget(QWidget):
 
     # ========== CLOSE ==========
     def closeEvent(self, event):
+        if self._is_recording:
+            try:
+                stt = get_stt()
+                stt.cancel_recording()
+            except Exception:
+                pass
+
+        if self._wake_enabled:
+            try:
+                ww = get_wake_word()
+                ww.stop()
+            except Exception:
+                pass
+
+        self._voice_mode = None
         self.save_position()
+
         if getattr(self, "tray_icon", None):
             self.hide()
             event.ignore()

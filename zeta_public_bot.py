@@ -3,6 +3,17 @@
 Публичный Telegram-бот Zeta.
 Не связан с ПК пользователя. Работает как ChatGPT.
 Поддерживает: выбор языка, анализ изображений, голосовые сообщения.
+
+ИСПРАВЛЕНО (2026-09-21):
+    - Токен из .env (python-dotenv)
+    - Обновлены модели: zeta-universal, llava:13b
+    - ask_zeta_sync вместо дублирующего ask_llm
+    - init_db() вызывается в run_bot, а не при импорте
+    - ask_zeta_sync в asyncio.to_thread
+    - Кэш IP-инфо на 5 минут
+    - handle_voice — одно сообщение
+    - except Exception вместо голого except
+    - parse_mode: хелпер с fallback
 """
 
 import os
@@ -12,38 +23,79 @@ import base64
 import sqlite3
 import re
 import tempfile
+import time
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
+
 import requests
-import json
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# === ЗАГРУЗКА .env ===
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    print("⚠️ python-dotenv не установлен: pip install python-dotenv")
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
-    ContextTypes, CallbackQueryHandler
+    ContextTypes, CallbackQueryHandler,
 )
 
-# ========== КОНФИГ ==========
-PUBLIC_BOT_TOKEN = "8718425332:AAGSiqUbJv7v6hcWuU3wmoQCJUAEYQS-nwA"
+# === ЕДИНАЯ ЛОГИКА ИИ (вместо своего ask_llm) ===
+from core.ai_engine import ask_zeta_sync
+
+
+# ========== КОНФИГ ИЗ .env ==========
+
+PUBLIC_BOT_TOKEN = os.getenv("ZETA_PUBLIC_BOT_TOKEN", "").strip()
+
+if not PUBLIC_BOT_TOKEN:
+    raise RuntimeError(
+        "❌ ZETA_PUBLIC_BOT_TOKEN не найден!\n"
+        "Создай файл D:\\Zeta\\.env со строкой:\n"
+        "   ZETA_PUBLIC_BOT_TOKEN=твой_токен_сюда\n"
+        "Токен получи у @BotFather (и СМЕНИ старый!)."
+    )
 
 # Ollama
 OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL_CHAT = "qwen2.5:7b"
-MODEL_VISION = "llava:latest"
+MODEL_CHAT = "zeta-universal"      # ИСПРАВЛЕНО
+MODEL_VISION = "llava:13b"         # ИСПРАВЛЕНО
 
 MAX_MESSAGE_LENGTH = 4000
 
+# Кэш IP-инфо (5 минут)
+_IP_CACHE_TTL = 300
+_ip_cache: Dict[str, Any] = {"data": None, "time": 0}
+
+
 # ========== ЛОГИРОВАНИЕ ==========
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
 
+# ========== ХЕЛПЕР parse_mode ==========
+
+async def safe_reply(message, text: str, **kwargs):
+    """
+    ИСПРАВЛЕНО: пытается Markdown, при ошибке — plain text.
+    """
+    try:
+        return await message.reply_text(text, parse_mode="Markdown", **kwargs)
+    except Exception:
+        # Markdown упал — пробуем без него
+        return await message.reply_text(text, **kwargs)
+
+
 # ========== ЯЗЫКИ ==========
+
 LANGUAGES: Dict[str, Dict[str, str]] = {
     "ru": {
         "name": "Русский",
@@ -59,7 +111,7 @@ LANGUAGES: Dict[str, Dict[str, str]] = {
         "image_analyzing": "🖼️ Анализирую изображение...",
         "image_error": "⚠️ Не удалось проанализировать изображение.",
         "lang_changed": "🌍 Язык изменён на: **Русский**",
-        "voice_processing": "🎤 Обрабатываю голосовое сообщение...",
+        "voice_processing": "🎤 Голосовые сообщения пока в разработке. Напиши текстом!",
         "lang_select": "🌍 **Выбери язык:**",
         "device_title": "📱 **Информация об устройстве**",
         "ip_title": "🌐 **Информация о подключении**",
@@ -81,7 +133,7 @@ LANGUAGES: Dict[str, Dict[str, str]] = {
         "image_analyzing": "🖼️ Analyzing image...",
         "image_error": "⚠️ Could not analyze image.",
         "lang_changed": "🌍 Language changed to: **English**",
-        "voice_processing": "🎤 Processing voice message...",
+        "voice_processing": "🎤 Voice messages are in development. Write text!",
         "lang_select": "🌍 **Select language:**",
         "device_title": "📱 **Device Information**",
         "ip_title": "🌐 **Connection Information**",
@@ -103,24 +155,32 @@ LANGUAGES: Dict[str, Dict[str, str]] = {
         "image_analyzing": "🖼️ Rasmni tahlil qilmoqdaman...",
         "image_error": "⚠️ Rasmni tahlil qilib bo'lmadi.",
         "lang_changed": "🌍 Til o'zgartirildi: **O'zbekcha**",
-        "voice_processing": "🎤 Ovozli xabarni qayta ishlayapman...",
+        "voice_processing": "🎤 Ovozli xabarlar ishlab chiqilmoqda. Matn yozing!",
         "lang_select": "🌍 **Tilni tanlang:**",
         "device_title": "📱 **Qurilma haqida ma'lumot**",
         "ip_title": "🌐 **Ulanish haqida ma'lumot**",
         "no_ip": "⚠️ Ulanish haqida ma'lumot olib bo'lmadi.",
         "loading": "⏳ Yuklanmoqda...",
         "done": "✅ Tayyor!",
-    }
+    },
 }
 
 
 # ========== БАЗА ДАННЫХ ==========
+
 DB_PATH = "data/public_bot.db"
+_db_initialized = False
+
 
 def init_db():
+    """ИСПРАВЛЕНО: идемпотентная инициализация."""
+    global _db_initialized
+    if _db_initialized:
+        return
+
     os.makedirs("data", exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute('''
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
@@ -128,8 +188,8 @@ def init_db():
                 content TEXT,
                 timestamp TEXT
             )
-        ''')
-        conn.execute('''
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS facts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
@@ -137,35 +197,41 @@ def init_db():
                 content TEXT,
                 timestamp TEXT
             )
-        ''')
-        conn.execute('''
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 user_id INTEGER PRIMARY KEY,
                 language TEXT
             )
-        ''')
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pub_msg_user ON messages(user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pub_fact_user ON facts(user_id)")
+
+    _db_initialized = True
 
 
 def save_message(user_id: int, role: str, content: str):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "INSERT INTO messages (user_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-            (user_id, role, content, datetime.now().isoformat())
+            (user_id, role, content, datetime.now().isoformat()),
         )
 
 
-def get_history(user_id: int, limit: int = 10) -> list:
+def get_history(user_id: int, limit: int = 10) -> List[Dict[str, str]]:
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
             "SELECT role, content FROM messages WHERE user_id = ? ORDER BY id DESC LIMIT ?",
-            (user_id, limit)
+            (user_id, limit),
         ).fetchall()
     return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
 
 
-def get_facts(user_id: int) -> list:
+def get_facts(user_id: int) -> List[Dict[str, str]]:
     with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute("SELECT key, content FROM facts WHERE user_id = ?", (user_id,)).fetchall()
+        rows = conn.execute(
+            "SELECT key, content FROM facts WHERE user_id = ?", (user_id,)
+        ).fetchall()
     return [{"key": r[0], "content": r[1]} for r in rows]
 
 
@@ -173,7 +239,7 @@ def save_fact(user_id: int, key: str, content: str):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "INSERT OR REPLACE INTO facts (user_id, key, content, timestamp) VALUES (?, ?, ?, ?)",
-            (user_id, key, content, datetime.now().isoformat())
+            (user_id, key, content, datetime.now().isoformat()),
         )
 
 
@@ -184,21 +250,23 @@ def clear_history(user_id: int):
 
 def get_language(user_id: int) -> str:
     with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute("SELECT language FROM settings WHERE user_id = ?", (user_id,)).fetchone()
+        row = conn.execute(
+            "SELECT language FROM settings WHERE user_id = ?", (user_id,)
+        ).fetchone()
     return row[0] if row else "ru"
 
 
 def set_language(user_id: int, lang: str):
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("INSERT OR REPLACE INTO settings (user_id, language) VALUES (?, ?)", (user_id, lang))
-
-
-init_db()
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (user_id, language) VALUES (?, ?)",
+            (user_id, lang),
+        )
 
 
 # ========== ОПРЕДЕЛЕНИЕ УСТРОЙСТВА ==========
+
 def detect_device(user_agent: str) -> str:
-    """Определяет устройство по User-Agent."""
     if not user_agent:
         return "Неизвестно"
     ua = user_agent.lower()
@@ -218,25 +286,16 @@ def detect_device(user_agent: str) -> str:
 
 
 def get_ip_info() -> dict:
-    """Получает информацию об IP."""
-    try:
-        response = requests.get("http://ip-api.com/json/", timeout=5)
-        data = response.json()
-        if data.get("status") == "success":
-            return {
-                "ip": data.get("query", "Неизвестно"),
-                "country": data.get("country", "Неизвестно"),
-                "city": data.get("city", "Неизвестно"),
-                "isp": data.get("isp", "Неизвестно"),
-                "org": data.get("org", "Неизвестно"),
-                "region": data.get("regionName", "Неизвестно"),
-                "timezone": data.get("timezone", "Неизвестно"),
-                "lat": data.get("lat", 0),
-                "lon": data.get("lon", 0),
-            }
-    except Exception:
-        pass
-    return {
+    """
+    ИСПРАВЛЕНО: кэш на 5 минут, чтобы не дёргать ip-api.com каждый раз.
+    """
+    now = time.time()
+
+    # Кэш
+    if _ip_cache["data"] is not None and now - _ip_cache["time"] < _IP_CACHE_TTL:
+        return _ip_cache["data"]
+
+    fallback = {
         "ip": "Неизвестно",
         "country": "Неизвестно",
         "city": "Неизвестно",
@@ -248,91 +307,85 @@ def get_ip_info() -> dict:
         "lon": 0,
     }
 
-
-# ========== ФУНКЦИИ ИИ ==========
-def ask_llm(user_message: str, user_id: int) -> str:
-    """Отправляет запрос к Ollama."""
     try:
-        history = get_history(user_id, limit=10)
-        facts = get_facts(user_id)
-
-        prompt = """
-Ты — Z, персональный ИИ-помощник.
-Твой характер: холодная, саркастичная, прямолинейная, но заботливая.
-Ты вдохновлена V из Murder Drones.
-Отвечай кратко, по существу. Иногда с лёгкой иронией.
-НЕ используй оскорбления, грубость или токсичность.
-ОТВЕЧАЙ НА ТОМ ЯЗЫКЕ, НА КОТОРОМ НАПИСАЛ ПОЛЬЗОВАТЕЛЬ.
-"""
-
-        if facts:
-            prompt += "\nФакты о пользователе:\n"
-            for fact in facts:
-                prompt += f"- {fact['key']}: {fact['content']}\n"
-
-        prompt += "\nИстория диалога:\n"
-        for msg in history:
-            role = "Пользователь" if msg["role"] == "user" else "Z"
-            prompt += f"{role}: {msg['content']}\n"
-        prompt += f"Пользователь: {user_message}\nZ:"
-
-        response = requests.post(
-            OLLAMA_URL,
-            json={"model": MODEL_CHAT, "prompt": prompt, "stream": False},
-            timeout=300
-        )
-        answer = response.json().get("response", "").strip()
-        return answer
-
-    except requests.exceptions.ConnectionError:
-        return "⚠️ Сервер ИИ временно недоступен."
+        response = requests.get("http://ip-api.com/json/", timeout=5)
+        data = response.json()
+        if data.get("status") == "success":
+            result = {
+                "ip": data.get("query", "Неизвестно"),
+                "country": data.get("country", "Неизвестно"),
+                "city": data.get("city", "Неизвестно"),
+                "isp": data.get("isp", "Неизвестно"),
+                "org": data.get("org", "Неизвестно"),
+                "region": data.get("regionName", "Неизвестно"),
+                "timezone": data.get("timezone", "Неизвестно"),
+                "lat": data.get("lat", 0),
+                "lon": data.get("lon", 0),
+            }
+            _ip_cache["data"] = result
+            _ip_cache["time"] = now
+            return result
     except Exception as e:
-        return f"⚠️ Ошибка: {str(e)}"
+        logger.warning(f"IP-api ошибка: {e}")
 
+    _ip_cache["data"] = fallback
+    _ip_cache["time"] = now
+    return fallback
+
+
+# ========== АНАЛИЗ ИЗОБРАЖЕНИЙ ==========
 
 def analyze_image(image_data: bytes) -> str:
     """Анализирует изображение через LLaVA."""
     try:
-        img_base64 = base64.b64encode(image_data).decode('utf-8')
+        img_base64 = base64.b64encode(image_data).decode("utf-8")
         response = requests.post(
             OLLAMA_URL,
             json={
                 "model": MODEL_VISION,
                 "prompt": "Опиши кратко что видишь на изображении. Только на русском языке.",
                 "images": [img_base64],
-                "stream": False
+                "stream": False,
             },
-            timeout=120
+            timeout=120,
         )
         answer = response.json().get("response", "").strip()
         return answer if answer else "Не удалось распознать изображение."
+    except requests.exceptions.Timeout:
+        return "⚠️ Модель зрения думает слишком долго."
     except Exception as e:
         return f"⚠️ Ошибка анализа: {str(e)}"
 
 
 # ========== КЛАВИАТУРА ==========
+
 def get_main_keyboard(lang: str = "ru"):
     texts = {
         "ru": ["💬 Чат", "🖼️ Анализ фото", "📱 Устройство", "🧠 Факты", "📜 История", "🗑️ Очистить", "❓ Помощь", "🌍 Язык"],
         "en": ["💬 Chat", "🖼️ Analyze Photo", "📱 Device", "🧠 Facts", "📜 History", "🗑️ Clear", "❓ Help", "🌍 Language"],
-        "uz": ["💬 Chat", "🖼️ Rasm tahlil", "📱 Qurilma", "🧠 Faktlar", "📜 Tarix", "🗑️ Tozalash", "❓ Yordam", "🌍 Til"]
+        "uz": ["💬 Chat", "🖼️ Rasm tahlil", "📱 Qurilma", "🧠 Faktlar", "📜 Tarix", "🗑️ Tozalash", "❓ Yordam", "🌍 Til"],
     }
     buttons = texts.get(lang, texts["ru"])
     return ReplyKeyboardMarkup(
-        [[buttons[0], buttons[1], buttons[2]], [buttons[3], buttons[4], buttons[5]], [buttons[6], buttons[7]]],
-        resize_keyboard=True
+        [
+            [buttons[0], buttons[1], buttons[2]],
+            [buttons[3], buttons[4], buttons[5]],
+            [buttons[6], buttons[7]],
+        ],
+        resize_keyboard=True,
     )
 
 
 # ========== КОМАНДЫ ==========
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     lang = get_language(user.id)
     texts = LANGUAGES.get(lang, LANGUAGES["ru"])
-    await update.message.reply_text(
+    await safe_reply(
+        update.message,
         texts["start"].format(name=user.first_name),
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard(lang)
+        reply_markup=get_main_keyboard(lang),
     )
 
 
@@ -340,7 +393,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     lang = get_language(user_id)
     texts = LANGUAGES.get(lang, LANGUAGES["ru"])
-    await update.message.reply_text(texts["help"], parse_mode="Markdown")
+    await safe_reply(update.message, texts["help"])
 
 
 async def device_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -351,17 +404,17 @@ async def device_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_agent = ""
     try:
-        if hasattr(update.message.from_user, 'user_agent'):
+        if hasattr(update.message.from_user, "user_agent"):
             user_agent = update.message.from_user.user_agent or ""
-    except:
+    except Exception:
         pass
 
-    platform = ""
+    platform = "Неизвестно"
     try:
-        if hasattr(update.message.from_user, 'platform'):
+        if hasattr(update.message.from_user, "platform"):
             platform = update.message.from_user.platform or "Неизвестно"
-    except:
-        platform = "Неизвестно"
+    except Exception:
+        pass
 
     device_model = detect_device(user_agent)
 
@@ -379,7 +432,7 @@ async def device_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📶 **Тип чата:** {update.message.chat.type}
 🔄 **Дата:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
     """.strip()
-    await update.message.reply_text(device_info, parse_mode="Markdown")
+    await safe_reply(update.message, device_info)
 
     ip_info = get_ip_info()
     if ip_info["ip"] != "Неизвестно":
@@ -395,9 +448,9 @@ async def device_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🏢 **Организация:** {ip_info['org']}
 📍 **Координаты:** {ip_info['lat']}, {ip_info['lon']}
         """.strip()
-        await update.message.reply_text(ip_text, parse_mode="Markdown")
+        await safe_reply(update.message, ip_text)
     else:
-        await update.message.reply_text(texts['no_ip'])
+        await update.message.reply_text(texts["no_ip"])
 
 
 async def fact_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -411,7 +464,7 @@ async def fact_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = texts["fact_title"] + "\n\n"
     for fact in facts:
         text += f"• {fact['key']}: {fact['content']}\n"
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await safe_reply(update.message, text)
 
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -429,7 +482,7 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(msg["content"]) > 200:
             content += "..."
         text += f"{role}: {content}\n"
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await safe_reply(update.message, text)
 
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -447,10 +500,10 @@ async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🇺🇿 O'zbekcha", callback_data="lang_uz")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
+    await safe_reply(
+        update.message,
         "🌍 **Выберите язык / Select language / Tilni tanlang:**",
-        parse_mode="Markdown",
-        reply_markup=reply_markup
+        reply_markup=reply_markup,
     )
 
 
@@ -461,24 +514,33 @@ async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = query.data.replace("lang_", "")
     set_language(user_id, lang)
     texts = LANGUAGES.get(lang, LANGUAGES["ru"])
-    await query.edit_message_text(texts["lang_changed"], parse_mode="Markdown")
+    try:
+        await query.edit_message_text(texts["lang_changed"], parse_mode="Markdown")
+    except Exception:
+        await query.edit_message_text(texts["lang_changed"])
     await query.message.reply_text(
         "🔄 Интерфейс обновлён!",
-        reply_markup=get_main_keyboard(lang)
+        reply_markup=get_main_keyboard(lang),
     )
 
 
 # ========== ОБРАБОТКА ИЗОБРАЖЕНИЙ ==========
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     lang = get_language(user_id)
     texts = LANGUAGES.get(lang, LANGUAGES["ru"])
+
     await update.message.reply_text(texts["image_analyzing"])
+
     try:
         photo = update.message.photo[-1]
         file = await photo.get_file()
         image_data = await file.download_as_bytearray()
-        result = analyze_image(image_data)
+
+        # ИСПРАВЛЕНО: анализ в отдельном потоке
+        result = await asyncio.to_thread(analyze_image, bytes(image_data))
+
         await update.message.reply_text(f"🖼️ {result}")
     except Exception as e:
         logger.error(f"Ошибка фото: {e}")
@@ -486,15 +548,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ========== ОБРАБОТКА ГОЛОСОВЫХ ==========
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ИСПРАВЛЕНО: одно сообщение вместо двух."""
     user_id = update.effective_user.id
     lang = get_language(user_id)
     texts = LANGUAGES.get(lang, LANGUAGES["ru"])
     await update.message.reply_text(texts["voice_processing"])
-    await update.message.reply_text("🎤 Голосовые сообщения пока в разработке. Напиши текст!")
 
 
 # ========== ОБРАБОТКА ТЕКСТА ==========
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
     user_id = update.effective_user.id
@@ -503,61 +567,75 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"Сообщение от {user_id}: {user_message[:50]}...")
 
+    # Кнопки
     if user_message in ["💬 Чат", "💬 Chat"]:
         await update.message.reply_text("💬 Напиши мне что-нибудь!")
         return
     if user_message in ["📱 Устройство", "📱 Device", "📱 Qurilma"]:
-        await device_command(update, context)
-        return
+        await device_command(update, context); return
     if user_message in ["🧠 Факты", "🧠 Facts", "🧠 Faktlar"]:
-        await fact_command(update, context)
-        return
+        await fact_command(update, context); return
     if user_message in ["📜 История", "📜 History", "📜 Tarix"]:
-        await history_command(update, context)
-        return
+        await history_command(update, context); return
     if user_message in ["🗑️ Очистить", "🗑️ Clear", "🗑️ Tozalash"]:
-        await clear_command(update, context)
-        return
+        await clear_command(update, context); return
     if user_message in ["❓ Помощь", "❓ Help", "❓ Yordam"]:
-        await help_command(update, context)
-        return
+        await help_command(update, context); return
     if user_message in ["🌍 Язык", "🌍 Language", "🌍 Til"]:
-        await language_command(update, context)
-        return
+        await language_command(update, context); return
     if user_message in ["🖼️ Анализ фото", "🖼️ Analyze Photo", "🖼️ Rasm tahlil"]:
         await update.message.reply_text("📸 Отправь мне фото!")
         return
 
+    # === ОТВЕТ ИИ ===
     await update.message.chat.send_action(action="typing")
-    thinking_msg = await update.message.reply_text(texts["thinking"], parse_mode="Markdown")
+    thinking_msg = await update.message.reply_text(
+        texts["thinking"], parse_mode="Markdown"
+    )
 
     try:
         save_message(user_id, "user", user_message)
-        answer = ask_llm(user_message, user_id)
+
+        # ИСПРАВЛЕНО: ask_zeta_sync в отдельном потоке
+        answer = await asyncio.to_thread(ask_zeta_sync, user_message)
+
         save_message(user_id, "assistant", answer)
 
         await thinking_msg.delete()
 
         if len(answer) > MAX_MESSAGE_LENGTH:
-            parts = [answer[i:i+MAX_MESSAGE_LENGTH] for i in range(0, len(answer), MAX_MESSAGE_LENGTH)]
+            parts = [
+                answer[i:i + MAX_MESSAGE_LENGTH]
+                for i in range(0, len(answer), MAX_MESSAGE_LENGTH)
+            ]
             for part in parts:
                 await update.message.reply_text(part)
         else:
             await update.message.reply_text(answer)
 
     except Exception as e:
-        await thinking_msg.delete()
+        try:
+            await thinking_msg.delete()
+        except Exception:
+            pass
         logger.error(f"Ошибка: {e}")
         await update.message.reply_text(texts["error"].format(e=str(e)))
 
 
 # ========== ЗАПУСК ==========
+
 def run_bot():
+    # ИСПРАВЛЕНО: init_db здесь, а не при импорте
+    init_db()
+
     print("🤖 Запуск Публичного Telegram-бота Zeta (PRO)...")
     print(f"📱 Токен: {PUBLIC_BOT_TOKEN[:20]}...")
+    print(f"🧠 Модель: {MODEL_CHAT}")
+    print(f"👁️ Зрение: {MODEL_VISION}")
 
     application = Application.builder().token(PUBLIC_BOT_TOKEN).build()
 
+    # Команды
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("device", device_command))
@@ -568,11 +646,13 @@ def run_bot():
 
     application.add_handler(CallbackQueryHandler(language_callback, pattern="^lang_"))
 
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+    )
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-    print("✅ Публичный бот запущен! Найдите бота в Telegram и напишите /start")
+    print("✅ Публичный бот запущен! Найди бота в Telegram и напиши /start")
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 

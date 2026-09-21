@@ -3,26 +3,43 @@
 Максимально расширенный модуль для поиска в интернете.
 Поддерживает: текстовый поиск, новости, изображения, видео, погоду, курсы валют,
 перевод, определение, калькулятор, википедию, карты, товары, рецепты, словари.
-Резервный поиск через Google.
+
+Особенности:
+    - Точные триггеры (не срабатывает на «как дела?»)
+    - Автоочистка кэша
+    - Разные TTL для разных типов (погода — 5 мин, wiki — 24 ч)
+    - Распознавание «картинка», «фото», «видео»
+    - Логирование в data/zeta.log
 """
 
-import warnings
+import sys
 import re
-import json
 import time
+import logging
+from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
 
-warnings.filterwarnings("ignore", message="This package.*has been renamed")
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# ========== ПРОВЕРКА БИБЛИОТЕК ==========
+
+# ========== ЛОГИРОВАНИЕ ==========
+
+def _log(msg: str) -> None:
+    logging.info(f"[SEARCH] {msg}")
+
+
+def _log_warn(msg: str) -> None:
+    logging.warning(f"[SEARCH] {msg}")
+
+
+# ========== БИБЛИОТЕКИ ==========
+
 try:
-    # Новая версия библиотеки
     from ddgs import DDGS
     HAS_DDGS = True
 except ImportError:
     try:
-        # Старая версия (резерв)
         from duckduckgo_search import DDGS
         HAS_DDGS = True
     except ImportError:
@@ -34,12 +51,6 @@ try:
 except ImportError:
     HAS_REQUESTS = False
 
-try:
-    from bs4 import BeautifulSoup
-    HAS_BS4 = True
-except ImportError:
-    HAS_BS4 = False
-
 
 # ========== КОНСТАНТЫ ==========
 
@@ -49,150 +60,181 @@ MAX_IMAGES_RESULTS = 5
 MAX_VIDEOS_RESULTS = 5
 TIMEOUT = 20
 MAX_TEXT_LENGTH = 500
-CACHE_TTL = 300  # 5 минут
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-}
+# Разные TTL для разных типов (секунды)
+TTL_WEB = 600       # 10 мин
+TTL_NEWS = 300      # 5 мин
+TTL_WEATHER = 300   # 5 мин
+TTL_CURRENCY = 1800 # 30 мин
+TTL_WIKI = 86400    # 24 часа
+TTL_RECIPE = 3600   # 1 час
+TTL_SHOPPING = 3600 # 1 час
+TTL_DEFINITION = 86400  # 24 часа
 
-# Ключевые слова для определения необходимости поиска
+# Точные триггеры (НЕ «как», НЕ «кто», НЕ «что» — они слишком частые)
 SEARCH_KEYWORDS = {
-    # Русские
-    "найди": "search",
-    "поищи": "search",
+    # Явные команды поиска
+    "найди в интернете": "search",
+    "поищи в интернете": "search",
     "погугли": "search",
+    "search for": "search",
+    "find on internet": "search",
+    "google it": "search",
+
+    # Явные команды на определение
     "что такое": "definition",
     "кто такой": "definition",
+    "кто такая": "definition",
     "что значит": "definition",
-    "когда": "search",
-    "где находится": "location",
-    "где": "search",
-    "новости": "news",
-    "погода": "weather",
-    "курс": "currency",
+    "дай определение": "definition",
+    "what is": "definition",
+    "who is": "definition",
+
+    # Явные новости
+    "новости про": "news",
+    "новости о": "news",
+    "последние новости": "news",
+    "что нового про": "news",
+    "news about": "news",
+
+    # Погода
+    "погода в": "weather",
+    "погода на": "weather",
+    "какая погода": "weather",
+    "weather in": "weather",
+
+    # Курс валют
+    "курс доллара": "currency",
+    "курс евро": "currency",
+    "курс рубля": "currency",
+    "курс валют": "currency",
+
+    # Цены и товары
     "сколько стоит": "price",
     "цена на": "price",
-    "переведи": "translate",
-    "как переводится": "translate",
+    "купить": "shopping",
+    "где купить": "shopping",
+
+    # Изображения / видео
+    "найди картинку": "images",
+    "найди фото": "images",
+    "покажи картинку": "images",
+    "покажи фото": "images",
+    "найди видео": "videos",
+    "покажи видео": "videos",
+
+    # Рецепты
     "рецепт": "recipe",
     "как приготовить": "recipe",
+    "как готовить": "recipe",
+
+    # Википедия
+    "wiki": "wikipedia",
     "вики": "wikipedia",
-    "определение": "definition",
-    "словарь": "dictionary",
-    "карта": "map",
-    "маршрут": "map",
+    "википедия": "wikipedia",
+
+    # Карты
+    "где находится": "map",
     "как добраться": "map",
-    "товары": "shopping",
-    "купить": "shopping",
+    "маршрут": "map",
+    "карта": "map",
+
+    # Отзывы
     "отзывы": "reviews",
     "оценка": "reviews",
-    
+
     # Английские
     "search for": "search",
     "find": "search",
-    "what is": "definition",
-    "who is": "definition",
     "news": "news",
     "weather": "weather",
     "price": "price",
-    "translate": "translate",
     "recipe": "recipe",
-    "wiki": "wikipedia",
     "map": "map",
     "shopping": "shopping",
     "reviews": "reviews",
 }
 
+# Общие вопросительные паттерны (только точные — не «как дела»)
+QUESTION_PATTERNS = [
+    r"\bчто\s+такое\b",
+    r"\bкто\s+так(ой|ая|ие)\b",
+    r"\bчто\s+значит\b",
+    r"\bкак\s+(приготовить|готовить|сделать|найти|купить|добраться)",
+    r"\bгде\s+(находится|купить|найти)",
+    r"\bкогда\s+(произошл|будет|выйдет|состоится)",
+    r"\bпочему\s+(произошл|случил|стал|работает|не\s+работает)",
+    r"\bсколько\s+(стоит|будет|стоят)",
+    r"\bновости\s+(про|о)\b",
+    r"\bпогода\b",
+]
+
 
 # ========== КЭШ ==========
 
-_search_cache: Dict[str, Tuple[str, float]] = {}
+_search_cache: Dict[str, Tuple[str, float, int]] = {}  # key → (result, timestamp, ttl)
 
 
 def _get_cached(key: str) -> Optional[str]:
     """Возвращает кэшированный результат."""
     if key in _search_cache:
-        result, timestamp = _search_cache[key]
-        if time.time() - timestamp < CACHE_TTL:
+        result, timestamp, ttl = _search_cache[key]
+        if time.time() - timestamp < ttl:
             return result
+        # Просрочен — удаляем
+        del _search_cache[key]
     return None
 
 
-def _set_cache(key: str, value: str) -> None:
-    """Сохраняет результат в кэш."""
-    _search_cache[key] = (value, time.time())
+def _set_cache(key: str, value: str, ttl: int = TTL_WEB) -> None:
+    """Сохраняет результат в кэш с TTL."""
+    _search_cache[key] = (value, time.time(), ttl)
+    _cleanup_cache()
 
 
-# ========== ПОИСК ЧЕРЕЗ GOOGLE (РЕЗЕРВ) ==========
-
-def search_google(query: str, max_results: int = MAX_RESULTS) -> List[Dict[str, str]]:
-    """Поиск через Google (парсинг HTML). Используется как резерв."""
-    if not HAS_REQUESTS or not HAS_BS4:
-        return []
-    
-    try:
-        url = f"https://www.google.com/search?q={query}&hl=ru"
-        response = requests.get(url, headers=HEADERS, timeout=10)
-        if response.status_code != 200:
-            return []
-        
-        soup = BeautifulSoup(response.text, "html.parser")
-        results = []
-        for g in soup.find_all("div", class_="g")[:max_results]:
-            title = g.find("h3")
-            link = g.find("a")
-            snippet = g.find("span", class_="aCOpRe")
-            if title and link:
-                results.append({
-                    "title": title.text.strip(),
-                    "url": link.get("href", ""),
-                    "body": snippet.text.strip() if snippet else ""
-                })
-        return results
-    except Exception:
-        return []
+def _cleanup_cache() -> None:
+    """Удаляет просроченные записи."""
+    now = time.time()
+    expired = [k for k, (_, ts, ttl) in _search_cache.items() if now - ts >= ttl]
+    for k in expired:
+        del _search_cache[k]
 
 
 # ========== ОСНОВНЫЕ ФУНКЦИИ ==========
 
-def search_web(query: str, max_results: int = MAX_RESULTS, timeout: int = TIMEOUT) -> str:
-    """Выполняет поиск в интернете через DuckDuckGo или Google (резерв)."""
+def search_web(query: str, max_results: int = MAX_RESULTS,
+               timeout: int = TIMEOUT) -> str:
+    """Поиск в интернете через DuckDuckGo."""
     if not query or not query.strip():
         return "⚠️ Укажите поисковый запрос."
+
+    if not HAS_DDGS:
+        return "⚠️ Установите ddgs: pip install ddgs"
 
     cache_key = f"web_{query.lower()}"
     cached = _get_cached(cache_key)
     if cached:
         return cached
 
-    results = []
-    
-    # Пробуем DuckDuckGo
-    if HAS_DDGS:
-        try:
-            with DDGS(timeout=timeout) as ddgs:
-                results = list(ddgs.text(query, max_results=max_results))
-        except Exception as e:
-            print(f"🔍 Ошибка DuckDuckGo: {e}")
-            results = []
-    
-    # Если DuckDuckGo пуст — пробуем Google
-    if not results:
-        results = search_google(query, max_results)
-    
+    try:
+        with DDGS(timeout=timeout) as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+    except Exception as e:
+        _log_warn(f"DuckDuckGo ошибка: {e}")
+        return f"⚠️ Ошибка поиска: {e}"
+
     if results:
         result = _format_results(results, query)
-        _set_cache(cache_key, result)
+        _set_cache(cache_key, result, TTL_WEB)
         return result
-    
+
     return f"🔍 По запросу `{query}` ничего не найдено."
 
 
 def search_news(query: str, max_results: int = MAX_NEWS_RESULTS) -> str:
-    """Ищет новости по запросу."""
+    """Новости по запросу."""
     if not HAS_DDGS:
-        return "⚠️ Установите duckduckgo-search: pip install duckduckgo-search"
-    
+        return "⚠️ Установите ddgs: pip install ddgs"
     if not query or not query.strip():
         return "⚠️ Укажите запрос для новостей."
 
@@ -206,7 +248,7 @@ def search_news(query: str, max_results: int = MAX_NEWS_RESULTS) -> str:
             results = list(ddgs.news(query, max_results=max_results))
             if results:
                 result = _format_news(results)
-                _set_cache(cache_key, result)
+                _set_cache(cache_key, result, TTL_NEWS)
                 return result
             return f"📰 Новостей по запросу `{query}` не найдено."
     except Exception as e:
@@ -214,10 +256,9 @@ def search_news(query: str, max_results: int = MAX_NEWS_RESULTS) -> str:
 
 
 def search_images(query: str, max_results: int = MAX_IMAGES_RESULTS) -> str:
-    """Ищет изображения по запросу."""
+    """Изображения по запросу."""
     if not HAS_DDGS:
-        return "⚠️ Установите duckduckgo-search: pip install duckduckgo-search"
-
+        return "⚠️ Установите ddgs: pip install ddgs"
     if not query or not query.strip():
         return "⚠️ Укажите запрос для изображений."
 
@@ -232,10 +273,9 @@ def search_images(query: str, max_results: int = MAX_IMAGES_RESULTS) -> str:
 
 
 def search_videos(query: str, max_results: int = MAX_VIDEOS_RESULTS) -> str:
-    """Ищет видео по запросу."""
+    """Видео по запросу."""
     if not HAS_DDGS:
-        return "⚠️ Установите duckduckgo-search: pip install duckduckgo-search"
-
+        return "⚠️ Установите ddgs: pip install ddgs"
     if not query or not query.strip():
         return "⚠️ Укажите запрос для видео."
 
@@ -250,10 +290,9 @@ def search_videos(query: str, max_results: int = MAX_VIDEOS_RESULTS) -> str:
 
 
 def search_weather(city: str) -> str:
-    """Ищет погоду в городе."""
+    """Погода в городе."""
     if not HAS_DDGS:
-        return "⚠️ Установите duckduckgo-search: pip install duckduckgo-search"
-
+        return "⚠️ Установите ddgs: pip install ddgs"
     if not city or not city.strip():
         return "⚠️ Укажите город."
 
@@ -268,7 +307,7 @@ def search_weather(city: str) -> str:
             results = list(ddgs.text(query, max_results=2))
             if results:
                 result = _format_weather(results, city)
-                _set_cache(cache_key, result)
+                _set_cache(cache_key, result, TTL_WEATHER)
                 return result
             return f"🌤️ Не удалось найти погоду для {city}."
     except Exception as e:
@@ -276,9 +315,9 @@ def search_weather(city: str) -> str:
 
 
 def search_currency(from_currency: str = "USD", to_currency: str = "UZS") -> str:
-    """Ищет курс валют."""
+    """Курс валют."""
     if not HAS_DDGS:
-        return "⚠️ Установите duckduckgo-search: pip install duckduckgo-search"
+        return "⚠️ Установите ddgs: pip install ddgs"
 
     cache_key = f"currency_{from_currency}_{to_currency}".lower()
     cached = _get_cached(cache_key)
@@ -291,7 +330,7 @@ def search_currency(from_currency: str = "USD", to_currency: str = "UZS") -> str
             results = list(ddgs.text(query, max_results=2))
             if results:
                 result = _format_currency(results, from_currency, to_currency)
-                _set_cache(cache_key, result)
+                _set_cache(cache_key, result, TTL_CURRENCY)
                 return result
             return f"💱 Не удалось найти курс {from_currency} к {to_currency}."
     except Exception as e:
@@ -299,10 +338,9 @@ def search_currency(from_currency: str = "USD", to_currency: str = "UZS") -> str
 
 
 def search_wikipedia(query: str) -> str:
-    """Ищет информацию в Википедии."""
+    """Информация из Википедии."""
     if not HAS_DDGS:
-        return "⚠️ Установите duckduckgo-search: pip install duckduckgo-search"
-
+        return "⚠️ Установите ddgs: pip install ddgs"
     if not query or not query.strip():
         return "⚠️ Укажите запрос для Википедии."
 
@@ -316,7 +354,7 @@ def search_wikipedia(query: str) -> str:
             results = list(ddgs.text(f"wiki {query}", max_results=2))
             if results:
                 result = _format_wikipedia(results, query)
-                _set_cache(cache_key, result)
+                _set_cache(cache_key, result, TTL_WIKI)
                 return result
             return f"📚 Информация по запросу `{query}` не найдена."
     except Exception as e:
@@ -324,10 +362,9 @@ def search_wikipedia(query: str) -> str:
 
 
 def search_recipe(query: str) -> str:
-    """Ищет рецепты."""
+    """Рецепты."""
     if not HAS_DDGS:
-        return "⚠️ Установите duckduckgo-search: pip install duckduckgo-search"
-
+        return "⚠️ Установите ddgs: pip install ddgs"
     if not query or not query.strip():
         return "⚠️ Укажите блюдо для рецепта."
 
@@ -341,7 +378,7 @@ def search_recipe(query: str) -> str:
             results = list(ddgs.text(f"рецепт {query}", max_results=2))
             if results:
                 result = _format_recipe(results, query)
-                _set_cache(cache_key, result)
+                _set_cache(cache_key, result, TTL_RECIPE)
                 return result
             return f"🍳 Рецепт для `{query}` не найден."
     except Exception as e:
@@ -349,10 +386,9 @@ def search_recipe(query: str) -> str:
 
 
 def search_shopping(query: str) -> str:
-    """Ищет товары."""
+    """Товары."""
     if not HAS_DDGS:
-        return "⚠️ Установите duckduckgo-search: pip install duckduckgo-search"
-
+        return "⚠️ Установите ddgs: pip install ddgs"
     if not query or not query.strip():
         return "⚠️ Укажите товар для поиска."
 
@@ -366,7 +402,7 @@ def search_shopping(query: str) -> str:
             results = list(ddgs.text(f"купить {query}", max_results=2))
             if results:
                 result = _format_shopping(results, query)
-                _set_cache(cache_key, result)
+                _set_cache(cache_key, result, TTL_SHOPPING)
                 return result
             return f"🛒 Товары по запросу `{query}` не найдены."
     except Exception as e:
@@ -374,10 +410,9 @@ def search_shopping(query: str) -> str:
 
 
 def search_definition(word: str) -> str:
-    """Ищет определение слова."""
+    """Определение слова."""
     if not HAS_DDGS:
-        return "⚠️ Установите duckduckgo-search: pip install duckduckgo-search"
-
+        return "⚠️ Установите ddgs: pip install ddgs"
     if not word or not word.strip():
         return "⚠️ Укажите слово для определения."
 
@@ -391,196 +426,187 @@ def search_definition(word: str) -> str:
             results = list(ddgs.text(f"определение {word}", max_results=2))
             if results:
                 result = _format_definition(results, word)
-                _set_cache(cache_key, result)
+                _set_cache(cache_key, result, TTL_DEFINITION)
                 return result
             return f"📖 Определение слова `{word}` не найдено."
     except Exception as e:
         return f"⚠️ Ошибка: {str(e)}"
 
 
-# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+# ========== ФОРМАТТЕРЫ ==========
 
 def _format_results(results: List[Dict[str, str]], query: str) -> str:
-    """Форматирует результаты поиска."""
     formatted = f"🔍 **Результаты поиска:** `{query}`\n\n"
     for i, r in enumerate(results, 1):
-        title = r.get('title', 'Без заголовка')
-        body = r.get('body', '')[:MAX_TEXT_LENGTH]
-        if len(r.get('body', '')) > MAX_TEXT_LENGTH:
-            body += "..."
-        href = r.get('href', '')
-        
+        title = r.get("title", "Без заголовка")
+        body = r.get("body", "")
+        if len(body) > MAX_TEXT_LENGTH:
+            body = body[:MAX_TEXT_LENGTH] + "..."
+        href = r.get("href", "")
+
         formatted += f"**{i}. {title}**\n"
         if href:
             formatted += f"🔗 {href}\n"
         if body:
             formatted += f"📝 {body}\n"
         formatted += "\n"
-    
     return formatted.strip()
 
 
 def _format_news(results: List[Dict[str, str]]) -> str:
-    """Форматирует результаты новостей."""
     formatted = "📰 **Новости:**\n\n"
     for i, r in enumerate(results, 1):
-        title = r.get('title', 'Без заголовка')
-        body = r.get('body', '')[:MAX_TEXT_LENGTH]
-        source = r.get('source', '')
-        date = r.get('date', '')
-        
+        title = r.get("title", "Без заголовка")
+        body = r.get("body", "")[:MAX_TEXT_LENGTH]
+        source = r.get("source", "")
+        date = r.get("date", "")
+
         formatted += f"**{i}. {title}**\n"
+        meta = []
         if source:
-            formatted += f"📰 {source}"
+            meta.append(f"📰 {source}")
         if date:
-            formatted += f" | 📅 {date}"
-        formatted += "\n"
+            meta.append(f"📅 {date}")
+        if meta:
+            formatted += " | ".join(meta) + "\n"
         if body:
             formatted += f"📝 {body}\n"
         formatted += "\n"
-    
     return formatted.strip()
 
 
 def _format_images(results: List[Dict[str, str]]) -> str:
-    """Форматирует результаты изображений."""
     formatted = "🖼️ **Изображения:**\n\n"
     for i, r in enumerate(results, 1):
-        title = r.get('title', 'Без названия')
-        image_url = r.get('image', '')
-        thumbnail = r.get('thumbnail', '')
-        
+        title = r.get("title", "Без названия")
+        image_url = r.get("image", "")
         formatted += f"**{i}. {title}**\n"
         if image_url:
             formatted += f"🖼️ {image_url}\n"
         formatted += "\n"
-    
     return formatted.strip()
 
 
 def _format_videos(results: List[Dict[str, str]]) -> str:
-    """Форматирует результаты видео."""
     formatted = "🎬 **Видео:**\n\n"
     for i, r in enumerate(results, 1):
-        title = r.get('title', 'Без названия')
-        source = r.get('source', '')
-        duration = r.get('duration', '')
-        
+        title = r.get("title", "Без названия")
+        source = r.get("source", "")
+        duration = r.get("duration", "")
+
         formatted += f"**{i}. {title}**\n"
+        meta = []
         if source:
-            formatted += f"🎥 {source}"
+            meta.append(f"🎥 {source}")
         if duration:
-            formatted += f" | ⏱️ {duration}"
+            meta.append(f"⏱️ {duration}")
+        if meta:
+            formatted += " | ".join(meta) + "\n"
         formatted += "\n"
-        formatted += "\n"
-    
     return formatted.strip()
 
 
 def _format_weather(results: List[Dict[str, str]], city: str) -> str:
-    """Форматирует погоду."""
     for r in results:
-        if "погода" in r['title'].lower() or "weather" in r['title'].lower():
-            title = r['title']
-            body = r['body'][:MAX_TEXT_LENGTH]
-            return f"🌤️ **Погода в {city}:**\n\n📌 {title}\n📝 {body}"
-    
+        t = r["title"].lower()
+        if "погода" in t or "weather" in t:
+            return (f"🌤️ **Погода в {city}:**\n\n"
+                    f"📌 {r['title']}\n📝 {r['body'][:MAX_TEXT_LENGTH]}")
     if results:
-        return f"🌤️ **Погода в {city}:**\n\n📌 {results[0]['title']}\n📝 {results[0]['body'][:MAX_TEXT_LENGTH]}"
-    
+        return (f"🌤️ **Погода в {city}:**\n\n"
+                f"📌 {results[0]['title']}\n📝 {results[0]['body'][:MAX_TEXT_LENGTH]}")
     return f"🌤️ Погода для {city} не найдена."
 
 
-def _format_currency(results: List[Dict[str, str]], from_curr: str, to_curr: str) -> str:
-    """Форматирует курс валют."""
+def _format_currency(results: List[Dict[str, str]], frm: str, to: str) -> str:
     for r in results:
-        if "exchange" in r['title'].lower() or "курс" in r['title'].lower():
-            return f"💱 **Курс {from_curr}/{to_curr}:**\n\n📌 {r['title']}\n📝 {r['body'][:MAX_TEXT_LENGTH]}"
-    
+        t = r["title"].lower()
+        if "exchange" in t or "курс" in t:
+            return (f"💱 **Курс {frm}/{to}:**\n\n"
+                    f"📌 {r['title']}\n📝 {r['body'][:MAX_TEXT_LENGTH]}")
     if results:
-        return f"💱 **Курс {from_curr}/{to_curr}:**\n\n📌 {results[0]['title']}\n📝 {results[0]['body'][:MAX_TEXT_LENGTH]}"
-    
-    return f"💱 Курс {from_curr} к {to_curr} не найден."
+        return (f"💱 **Курс {frm}/{to}:**\n\n"
+                f"📌 {results[0]['title']}\n📝 {results[0]['body'][:MAX_TEXT_LENGTH]}")
+    return f"💱 Курс {frm} к {to} не найден."
 
 
 def _format_wikipedia(results: List[Dict[str, str]], query: str) -> str:
-    """Форматирует Википедию."""
     for r in results:
-        if "wiki" in r['href'].lower() or "wikipedia" in r['href'].lower():
-            return f"📚 **Википедия:** `{query}`\n\n📌 {r['title']}\n📝 {r['body'][:MAX_TEXT_LENGTH]}\n🔗 {r['href']}"
-    
+        href = r.get("href", "").lower()
+        if "wiki" in href or "wikipedia" in href:
+            return (f"📚 **Википедия:** `{query}`\n\n"
+                    f"📌 {r['title']}\n📝 {r['body'][:MAX_TEXT_LENGTH]}\n🔗 {r['href']}")
     if results:
-        return f"📚 **Википедия:** `{query}`\n\n📌 {results[0]['title']}\n📝 {results[0]['body'][:MAX_TEXT_LENGTH]}\n🔗 {results[0]['href']}"
-    
+        return (f"📚 **Википедия:** `{query}`\n\n"
+                f"📌 {results[0]['title']}\n📝 {results[0]['body'][:MAX_TEXT_LENGTH]}\n🔗 {results[0]['href']}")
     return f"📚 Информация по запросу `{query}` не найдена."
 
 
 def _format_recipe(results: List[Dict[str, str]], query: str) -> str:
-    """Форматирует рецепт."""
     for r in results:
-        if "рецепт" in r['title'].lower() or "recipe" in r['title'].lower():
-            return f"🍳 **Рецепт:** `{query}`\n\n📌 {r['title']}\n📝 {r['body'][:MAX_TEXT_LENGTH]}\n🔗 {r['href']}"
-    
+        t = r["title"].lower()
+        if "рецепт" in t or "recipe" in t:
+            return (f"🍳 **Рецепт:** `{query}`\n\n"
+                    f"📌 {r['title']}\n📝 {r['body'][:MAX_TEXT_LENGTH]}\n🔗 {r['href']}")
     if results:
-        return f"🍳 **Рецепт:** `{query}`\n\n📌 {results[0]['title']}\n📝 {results[0]['body'][:MAX_TEXT_LENGTH]}\n🔗 {results[0]['href']}"
-    
+        return (f"🍳 **Рецепт:** `{query}`\n\n"
+                f"📌 {results[0]['title']}\n📝 {results[0]['body'][:MAX_TEXT_LENGTH]}\n🔗 {results[0]['href']}")
     return f"🍳 Рецепт для `{query}` не найден."
 
 
 def _format_shopping(results: List[Dict[str, str]], query: str) -> str:
-    """Форматирует товары."""
     formatted = f"🛒 **Товары:** `{query}`\n\n"
     for i, r in enumerate(results, 1):
-        title = r.get('title', 'Без названия')
-        body = r.get('body', '')[:MAX_TEXT_LENGTH]
-        href = r.get('href', '')
-        
-        formatted += f"**{i}. {title}**\n"
-        if href:
-            formatted += f"🔗 {href}\n"
-        if body:
-            formatted += f"📝 {body}\n"
+        formatted += f"**{i}. {r.get('title', 'Без названия')}**\n"
+        if r.get("href"):
+            formatted += f"🔗 {r['href']}\n"
+        if r.get("body"):
+            formatted += f"📝 {r['body'][:MAX_TEXT_LENGTH]}\n"
         formatted += "\n"
-    
     return formatted.strip()
 
 
 def _format_definition(results: List[Dict[str, str]], word: str) -> str:
-    """Форматирует определение."""
     for r in results:
-        if "определение" in r['title'].lower() or "definition" in r['title'].lower():
-            return f"📖 **Определение:** `{word}`\n\n📌 {r['title']}\n📝 {r['body'][:MAX_TEXT_LENGTH]}"
-    
+        t = r["title"].lower()
+        if "определение" in t or "definition" in t:
+            return (f"📖 **Определение:** `{word}`\n\n"
+                    f"📌 {r['title']}\n📝 {r['body'][:MAX_TEXT_LENGTH]}")
     if results:
-        return f"📖 **Определение:** `{word}`\n\n📌 {results[0]['title']}\n📝 {results[0]['body'][:MAX_TEXT_LENGTH]}"
-    
+        return (f"📖 **Определение:** `{word}`\n\n"
+                f"📌 {results[0]['title']}\n📝 {results[0]['body'][:MAX_TEXT_LENGTH]}")
     return f"📖 Определение слова `{word}` не найдено."
 
+
+# ========== ИЗВЛЕЧЕНИЕ ЗАПРОСА ==========
 
 def _extract_search_query(message: str) -> Optional[str]:
     """Извлекает поисковый запрос из сообщения."""
     if not message:
         return None
-    
+
     msg_lower = message.lower()
-    
+
+    # Явные команды
     commands = [
         "найди в интернете", "поищи в интернете", "погугли",
         "search for", "find on internet", "google it",
-        "найди", "поищи"
+        "найди", "поищи",
     ]
     for cmd in commands:
         if msg_lower.startswith(cmd):
             query = message[len(cmd):].strip()
             if query:
                 return query
-            break
-    
+
+    # Паттерны
     patterns = [
         r"что такое\s+(.+)",
         r"кто такой\s+(.+)",
+        r"кто такая\s+(.+)",
         r"где находится\s+(.+)",
         r"новости про\s+(.+)",
+        r"новости о\s+(.+)",
         r"погода в\s+(.+)",
         r"цена на\s+(.+)",
         r"сколько стоит\s+(.+)",
@@ -589,121 +615,116 @@ def _extract_search_query(message: str) -> Optional[str]:
         r"определение\s+(.+)",
         r"wiki\s+(.+)",
         r"вики\s+(.+)",
-        r"курс\s+(\w+)\s+к\s+(\w+)",
     ]
     for pattern in patterns:
         match = re.search(pattern, msg_lower)
         if match:
-            if len(match.groups()) == 2:
-                return f"{match.group(1)} {match.group(2)}"
             return match.group(1).strip()
-    
+
     return message
 
 
 def detect_search_type(message: str) -> str:
     """Определяет тип поиска по сообщению."""
     msg_lower = message.lower()
-    
+
     for keyword, search_type in SEARCH_KEYWORDS.items():
         if keyword in msg_lower:
             return search_type
-    
+
     return "search"
 
 
-# ========== ОСНОВНЫЕ ФУНКЦИИ ДЛЯ ИНТЕГРАЦИИ ==========
+# ========== УМНЫЙ ПОИСК ==========
 
 def quick_search(message: str) -> str:
-    """Умный поиск: определяет тип запроса и выбирает подходящий метод."""
+    """Умный поиск: определяет тип и вызывает нужную функцию."""
     msg_lower = message.lower()
     search_type = detect_search_type(message)
-    
+
     # Погода
     if search_type == "weather" or "погода" in msg_lower:
-        import re
-        city_match = re.search(r"погода\s+в\s+([\w\s]+)", msg_lower)
-        city_match2 = re.search(r"погода\s+([\w\s]+)", msg_lower)
-        if city_match:
-            return search_weather(city_match.group(1).strip())
-        if city_match2:
-            return search_weather(city_match2.group(1).strip())
+        m = re.search(r"погода\s+(?:в\s+)?([\w\s]+)", msg_lower)
+        if m:
+            return search_weather(m.group(1).strip())
         return search_weather("Ташкент")
-    
-    # Курс валют
-    if search_type == "currency" or "курс" in msg_lower or "доллар" in msg_lower:
+
+    # Курс
+    if search_type == "currency" or "курс" in msg_lower:
         if "доллар" in msg_lower or "usd" in msg_lower:
             return search_currency("USD", "UZS")
         if "евро" in msg_lower or "eur" in msg_lower:
             return search_currency("EUR", "UZS")
-        if "рубль" in msg_lower or "rub" in msg_lower:
+        if "рубл" in msg_lower or "rub" in msg_lower:
             return search_currency("RUB", "UZS")
         return search_currency("USD", "UZS")
-    
+
+    # Изображения
+    if search_type == "images" or "картинк" in msg_lower or "фото" in msg_lower:
+        query = _extract_search_query(message)
+        return search_images(query or message)
+
+    # Видео
+    if search_type == "videos" or "видео" in msg_lower:
+        query = _extract_search_query(message)
+        return search_videos(query or message)
+
     # Новости
     if search_type == "news" or "новости" in msg_lower:
-        import re
-        news_match = re.search(r"новости\s+(?:про|о)\s+(.+)", msg_lower)
-        if news_match:
-            return search_news(news_match.group(1).strip())
+        m = re.search(r"новости\s+(?:про|о)\s+(.+)", msg_lower)
+        if m:
+            return search_news(m.group(1).strip())
         return search_news(message)
-    
+
     # Википедия
     if search_type == "wikipedia" or "wiki" in msg_lower or "вики" in msg_lower:
         query = _extract_search_query(message)
-        if query:
-            return search_wikipedia(query)
-        return search_wikipedia(message)
-    
+        return search_wikipedia(query or message)
+
     # Рецепты
     if search_type == "recipe" or "рецепт" in msg_lower or "приготовить" in msg_lower:
         query = _extract_search_query(message)
-        if query:
-            return search_recipe(query)
-        return search_recipe(message)
-    
+        return search_recipe(query or message)
+
     # Определение
     if search_type == "definition" or "что такое" in msg_lower or "кто такой" in msg_lower:
         query = _extract_search_query(message)
-        if query:
-            return search_definition(query)
-        return search_definition(message)
-    
+        return search_definition(query or message)
+
     # Обычный поиск
     query = _extract_search_query(message)
-    if query:
-        return search_web(query)
-    
-    return search_web(message)
+    return search_web(query or message)
 
 
 def needs_search(message: str) -> bool:
-    """Определяет, нужно ли выполнять поиск для данного сообщения."""
+    """
+    Определяет, нужно ли выполнять поиск.
+    ТОЛЬКО точные триггеры — не срабатывает на «как дела?».
+    """
     if not message:
         return False
-    
+
     msg_lower = message.lower()
-    
-    # Проверка на явные команды
+
+    # 1. Явные ключевые слова (точное вхождение)
     for keyword in SEARCH_KEYWORDS:
         if keyword in msg_lower:
             return True
-    
-    # Проверка на вопросительные слова
-    question_words = ["что", "кто", "где", "когда", "почему", "зачем", "как", "сколько"]
-    if any(word in msg_lower for word in question_words) and "?" in message:
-        return True
-    
+
+    # 2. Точные вопросительные паттерны
+    for pattern in QUESTION_PATTERNS:
+        if re.search(pattern, msg_lower):
+            return True
+
     return False
 
 
-# ========== ДОПОЛНИТЕЛЬНЫЕ ФУНКЦИИ ==========
+# ========== ДОПОЛНИТЕЛЬНЫЕ ==========
 
 def get_search_suggestions(query: str) -> List[str]:
-    """Получает предложения поиска (автодополнение)."""
+    """Автодополнение поиска."""
     if not HAS_DDGS:
         return []
-    
     try:
         with DDGS(timeout=5) as ddgs:
             return list(ddgs.suggestions(query))
@@ -712,10 +733,10 @@ def get_search_suggestions(query: str) -> List[str]:
 
 
 def search_answers(query: str) -> str:
-    """Ищет прямой ответ (instant answer)."""
+    """Прямой ответ (instant answer)."""
     if not HAS_DDGS:
-        return "⚠️ Установите duckduckgo-search: pip install duckduckgo-search"
-    
+        return "⚠️ Установите ddgs: pip install ddgs"
+
     try:
         with DDGS(timeout=TIMEOUT) as ddgs:
             results = list(ddgs.answers(query))
@@ -727,12 +748,11 @@ def search_answers(query: str) -> str:
 
 
 def _format_answers(results: List[Dict[str, str]]) -> str:
-    """Форматирует прямой ответ."""
     formatted = "⚡ **Прямой ответ:**\n\n"
     for r in results:
-        if r.get('text'):
+        if r.get("text"):
             formatted += f"📝 {r['text']}\n"
-        if r.get('url'):
+        if r.get("url"):
             formatted += f"🔗 {r['url']}\n"
         formatted += "\n"
     return formatted.strip()
@@ -741,66 +761,65 @@ def _format_answers(results: List[Dict[str, str]]) -> str:
 # ========== ЭКСПОРТ ==========
 
 __all__ = [
-    'search_web', 'search_news', 'search_images', 'search_videos',
-    'search_weather', 'search_currency', 'search_wikipedia',
-    'search_recipe', 'search_shopping', 'search_definition',
-    'quick_search', 'needs_search', 'detect_search_type',
-    'get_search_suggestions', 'search_answers', 'search_google',
+    "search_web", "search_news", "search_images", "search_videos",
+    "search_weather", "search_currency", "search_wikipedia",
+    "search_recipe", "search_shopping", "search_definition",
+    "quick_search", "needs_search", "detect_search_type",
+    "get_search_suggestions", "search_answers",
 ]
 
 
 # ========== ТЕСТ ==========
+
 if __name__ == "__main__":
-    import time
-    
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+
     print("🧪 Тест web_search.py\n")
-    
+    print("=" * 60)
+
     if not HAS_DDGS:
-        print("⚠️ Установите duckduckgo-search: pip install duckduckgo-search")
-    else:
-        print("📝 Тест 1: Поиск")
-        result = search_web("Zeta ИИ ассистент")
-        print(result[:300] + "..." if len(result) > 300 else result)
-        print("-" * 40)
-        
-        print("📝 Тест 2: Погода")
-        result = search_weather("Ташкент")
-        print(result)
-        print("-" * 40)
-        
-        print("📝 Тест 3: Курс валют")
-        result = search_currency("USD", "UZS")
-        print(result)
-        print("-" * 40)
-        
-        print("📝 Тест 4: quick_search")
-        tests = [
-            "погода в Ташкенте",
-            "курс доллара",
-            "кто такой Samriddin",
-            "новости про ИИ",
-            "рецепт плова",
-        ]
-        for t in tests:
-            print(f"\n{t} →")
-            result = quick_search(t)
-            print(result[:200] + "..." if len(result) > 200 else result)
-        print("-" * 40)
-        
-        print("📝 Тест 5: needs_search")
-        tests = [
-            "погода в Ташкенте",
-            "кто такой Samriddin",
-            "привет как дела",
-            "что такое RAG",
-        ]
-        for t in tests:
-            print(f"{t} → {needs_search(t)}")
-        print("-" * 40)
-        
-        print("📝 Тест 6: Википедия")
-        result = search_wikipedia("Искусственный интеллект")
-        print(result[:300] + "..." if len(result) > 300 else result)
-        print("-" * 40)
-        
-        print("\n✅ Тесты завершены!")
+        print("⚠️ Установите ddgs: pip install ddgs")
+        sys.exit(1)
+
+    print("\n📝 Тест 1: needs_search (не должно ловить обычное)")
+    tests = [
+        ("как дела?", False),          # ← НЕ поиск
+        ("что ты умеешь?", False),     # ← НЕ поиск
+        ("кто ты?", False),            # ← НЕ поиск
+        ("привет", False),             # ← НЕ поиск
+        ("погода в Ташкенте", True),   # ← поиск
+        ("что такое RAG", True),       # ← поиск
+        ("найди в интернете Python", True),  # ← поиск
+        ("новости про ИИ", True),      # ← поиск
+    ]
+    for msg, expected in tests:
+        result = needs_search(msg)
+        marker = "✅" if result == expected else "❌"
+        print(f"  {marker} {msg!r:35} → {result}")
+
+    print("\n📝 Тест 2: Простой поиск")
+    result = search_web("Python asyncio")
+    print(result[:300] + "..." if len(result) > 300 else result)
+
+    print("\n📝 Тест 3: Погода")
+    print(search_weather("Ташкент")[:200])
+
+    print("\n📝 Тест 4: quick_search")
+    for q in ["погода в Ташкенте", "курс доллара", "что такое Python"]:
+        print(f"\n  {q} →")
+        print("  " + quick_search(q)[:200])
+
+    print("\n📝 Тест 5: Кэш (повторный запрос)")
+    t0 = time.time()
+    search_web("Python")
+    t1 = time.time()
+    search_web("Python")
+    t2 = time.time()
+    print(f"  Первый запрос: {(t1-t0):.2f} сек")
+    print(f"  Второй (из кэша): {(t2-t1):.4f} сек")
+
+    print("\n" + "=" * 60)
+    print("✅ Тесты завершены!")

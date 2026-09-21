@@ -1,74 +1,101 @@
 # -*- coding: utf-8 -*-
 """
 Модуль маршрутизации запросов Zeta.
-Определяет, что хочет пользователь: команду или обычный вопрос.
+
+Тонкая обёртка над ai_engine.detect_command_type().
+Вся логика маршрутизации — в core/ai_engine.py (единая точка).
+Этот модуль сохранён для обратной совместимости API RequestRouter.route().
 """
 
-import os  # ← ДОБАВЛЕНО!
+import sys
 import re
-from typing import Optional, Tuple, Dict, Any
+from pathlib import Path
+from typing import Dict, Any
+
+# Добавляем корень проекта в sys.path — чтобы работало и при `python core\router.py`
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# Импорт основной логики маршрутизации
+try:
+    from core.ai_engine import detect_command_type
+except ImportError as e:
+    raise ImportError(
+        f"Не удалось импортировать core.ai_engine.detect_command_type: {e}\n"
+        f"Проверь, что файл D:\\Zeta\\core\\ai_engine.py существует "
+        f"и не падает при импорте."
+    ) from e
+
+
+# Паттерн для определения code-запросов
+_CODE_PATTERN = re.compile(
+    r"(напиши|создай|сгенерируй|исправь|допиши|добавь|обнови)\s+"
+    r"(код|функцию|файл|класс|метод|скрипт|модуль)",
+    re.IGNORECASE
+)
 
 
 class RequestRouter:
     """
     Анализирует запрос пользователя и определяет, что нужно сделать.
+
+    Делегирует в ai_engine.detect_command_type().
+    Возвращает словарь {"type", "confidence", "data"}.
     """
 
-    # ========== ЯВНЫЕ КОМАНДЫ ==========
+    # ========== СОВМЕСТИМОСТЬ: СТАРЫЕ МЕТОДЫ ==========
 
     @staticmethod
     def is_explicit_reminder(text: str) -> bool:
-        """Проверяет, есть ли явная команда на напоминание."""
-        keywords = ["напомни", "напомните", "remind", "не забудь", "будильник", "напоминание"]
-        return any(kw in text.lower() for kw in keywords)
+        return bool(re.match(r"^(напомни|напомните|не забудь|remind)\b", text.lower().strip()))
 
     @staticmethod
     def is_explicit_status(text: str) -> bool:
-        """Проверяет, есть ли явная команда на статус системы."""
-        keywords = ["статус системы", "состояние системы", "загрузка", "cpu", "ram", "диск", "мониторинг"]
-        return any(kw in text.lower() for kw in keywords)
+        return bool(re.match(
+            r"^(статус системы|покажи статус|/status)\b",
+            text.lower().strip()
+        ))
 
     @staticmethod
     def is_explicit_git(text: str) -> bool:
-        """Проверяет, есть ли явная команда Git."""
-        keywords = ["git status", "git diff", "git commit", "git log", "git branch", "git stash"]
-        return any(kw in text.lower() for kw in keywords)
+        return bool(re.match(r"^git\s+", text.lower().strip()))
 
     @staticmethod
     def is_explicit_rag(text: str) -> bool:
-        """Проверяет, есть ли явная команда RAG (документы)."""
-        keywords = ["загрузи документ", "загрузи файл", "прочитай документ", "покажи документы", "очисти документы"]
-        return any(kw in text.lower() for kw in keywords)
+        return bool(re.match(
+            r"^(загрузи документ|прочитай документ|покажи документы|очисти документы)\b",
+            text.lower().strip()
+        ))
 
     @staticmethod
     def is_explicit_file(text: str) -> bool:
-        """Проверяет, есть ли явная команда для файлов."""
-        keywords = ["открой файл", "открой папку", "найди файл", "найди папку", "покажи папку", "покажи файл"]
-        return any(kw in text.lower() for kw in keywords)
+        low = text.lower().strip()
+        return bool(
+            re.match(r"^(открой|откройте|open)\s+(файл|папку)\b", low) or
+            re.match(r"^(найди|где)\s+(файл|папку)\b", low) or
+            re.match(r"^(покажи|list)\s+(папку|содержимое)\b", low)
+        )
 
     @staticmethod
     def is_explicit_screenshot(text: str) -> bool:
-        """Проверяет, есть ли явная команда для скриншота."""
-        keywords = ["посмотри на экран", "сделай скрин", "скриншот", "что на экране", "опиши экран"]
-        return any(kw in text.lower() for kw in keywords)
+        return bool(re.match(
+            r"^(сделай скрин|сделай скриншот|посмотри на экран|что на экране|/screenshot)\b",
+            text.lower().strip()
+        ))
 
     @staticmethod
     def is_explicit_translation(text: str) -> bool:
-        """Проверяет, есть ли явная команда для перевода."""
-        keywords = ["переведи", "перевод", "translate"]
-        return any(kw in text.lower() for kw in keywords)
+        return bool(re.match(r"^(переведи|translate)\b", text.lower().strip()))
 
     @staticmethod
     def is_explicit_code(text: str) -> bool:
-        """Проверяет, есть ли явная команда для кода."""
-        keywords = ["напиши код", "создай код", "исправь код", "сгенерируй код"]
-        return any(kw in text.lower() for kw in keywords)
+        return bool(_CODE_PATTERN.search(text))
 
     @staticmethod
     def is_explicit_search(text: str) -> bool:
-        """Проверяет, есть ли явная команда для поиска."""
-        keywords = ["найди в интернете", "поищи", "узнай", "проверь"]
-        return any(kw in text.lower() for kw in keywords)
+        return bool(re.match(
+            r"^(найди в интернете|поищи в интернете|погугли)\b",
+            text.lower().strip()
+        ))
 
     # ========== ОСНОВНОЙ МЕТОД ==========
 
@@ -76,59 +103,63 @@ class RequestRouter:
     def route(cls, text: str) -> Dict[str, Any]:
         """
         Анализирует запрос и возвращает тип действия.
+
+        Возвращает:
+            {"type": "<тип>", "confidence": float, "data": dict}
         """
-        text_lower = text.lower().strip()
+        if not text or not text.strip():
+            return {"type": "chat", "confidence": 1.0, "data": {}}
 
-        # --- Проверяем явные команды ---
+        try:
+            cmd_type, cmd_data = detect_command_type(text)
+        except Exception:
+            return {"type": "chat", "confidence": 1.0, "data": {}}
 
-        if cls.is_explicit_reminder(text):
-            from modules.notifications import needs_reminder
-            minutes, reminder_text = needs_reminder(text)
-            if minutes:
-                return {
-                    "type": "reminder",
-                    "confidence": 1.0,
-                    "data": {"minutes": minutes, "text": reminder_text}
-                }
+        # Спец-случай: code-запросы (ai_engine помечает их как "chat")
+        if cmd_type == "chat" and cls.is_explicit_code(text):
+            return {
+                "type": "code",
+                "confidence": 0.9,
+                "data": {"request": text}
+            }
 
-        if cls.is_explicit_status(text):
-            return {"type": "status", "confidence": 1.0, "data": {}}
+        return {
+            "type": cmd_type,
+            "confidence": 1.0,
+            "data": cmd_data
+        }
 
-        if cls.is_explicit_git(text):
-            if "status" in text_lower:
-                return {"type": "git", "confidence": 1.0, "data": {"command": "status"}}
-            if "diff" in text_lower:
-                return {"type": "git", "confidence": 1.0, "data": {"command": "diff"}}
-            if "commit" in text_lower:
-                return {"type": "git", "confidence": 1.0, "data": {"command": "commit"}}
-            if "log" in text_lower:
-                return {"type": "git", "confidence": 1.0, "data": {"command": "log"}}
-            return {"type": "git", "confidence": 1.0, "data": {"command": "status"}}
 
-        if cls.is_explicit_rag(text):
-            return {"type": "rag", "confidence": 1.0, "data": {"command": text}}
+# ========== УДОБНЫЕ ФУНКЦИИ ==========
 
-        if cls.is_explicit_file(text):
-            from modules.file_manager import needs_file_action
-            action, detail = needs_file_action(text)
-            if action:
-                return {"type": "file", "confidence": 1.0, "data": {"action": action, "detail": detail}}
+def route(text: str) -> Dict[str, Any]:
+    """Сахар: route("...") вместо RequestRouter.route("...")."""
+    return RequestRouter.route(text)
 
-        if cls.is_explicit_screenshot(text):
-            return {"type": "screenshot", "confidence": 1.0, "data": {}}
 
-        if cls.is_explicit_translation(text):
-            from modules.translator import needs_translation
-            lang, translate_text = needs_translation(text)
-            if lang and translate_text:
-                return {"type": "translation", "confidence": 1.0, "data": {"lang": lang, "text": translate_text}}
+# ========== ТЕСТ ==========
+if __name__ == "__main__":
+    tests = [
+        "привет, как дела",
+        "напомни через 5 минут позвонить маме",
+        "статус системы",
+        "git status",
+        "git push origin main",
+        "открой файл D:\\test.txt",
+        "сделай скриншот",
+        "переведи hello на русский",
+        "загрузи документ D:\\doc.pdf",
+        "погугли python asyncio",
+        "напиши функцию сортировки",
+        "узнай про Python",
+        "Ты когда-нибудь напоминал?",
+    ]
 
-        if cls.is_explicit_code(text):
-            return {"type": "code", "confidence": 0.9, "data": {"request": text}}
-
-        if cls.is_explicit_search(text):
-            return {"type": "search", "confidence": 0.9, "data": {"query": text}}
-
-        # --- Если ни одна явная команда не сработала → ЭТО ЧАТ! ---
-
-        return {"type": "chat", "confidence": 1.0, "data": {}}
+    print("🧪 Тест router.py\n")
+    print("=" * 60)
+    for t in tests:
+        r = route(t)
+        print(f"\n📝 {t}")
+        print(f"   → type: {r['type']}")
+        print(f"   → data: {r['data']}")
+    print("\n✅ Тесты пройдены!")

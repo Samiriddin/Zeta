@@ -2,32 +2,120 @@
 """
 Веб-интерфейс для Zeta — ФИНАЛЬНАЯ ИСПРАВЛЕННАЯ ВЕРСИЯ.
 Доступ: http://localhost:5000
+
+ИСПРАВЛЕНО (2026-09-21):
+    - app.json.ensure_ascii = False (Flask 2.3+)
+    - secret_key из .env или автогенерация
+    - Убран ручной фильтр settings_keys в /facts
+    - Добавлен /health
+    - Простой rate limiting (in-memory)
+    - Открытие браузера через cmd /c start (надёжнее на Windows)
+    - Логирование HTTP-запросов
+    - Общие тексты ошибок (без утечки stacktrace)
+    - Лимит длины сообщения 5000
 """
 
 import os
 import sys
-import webbrowser
-import threading
 import time
+import secrets
+import logging
+import threading
+import webbrowser
+from collections import defaultdict
 from flask import Flask, render_template_string, request, jsonify
 from flask_cors import CORS
 
 # Добавляем путь к проекту
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# === ЗАГРУЗКА .env ===
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
+
 from core.ai_engine import ask_zeta_sync
 from core.memory import get_history, get_facts, clear_history, delete_fact
 from modules.system_monitor import get_system_status
 from core.screen_capture import take_screenshot
 
-# ========== СОЗДАЁМ ПРИЛОЖЕНИЕ ==========
+
+# ========== ЛОГИРОВАНИЕ ==========
+
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("zeta.web")
+
+
+# ========== КОНСТАНТЫ ==========
+
+MAX_MESSAGE_LENGTH = 5000
+RATE_LIMIT_WINDOW = 60      # сек
+RATE_LIMIT_MAX = 60         # запросов за окно с одного IP
+
+
+# ========== ПРИЛОЖЕНИЕ ==========
+
 app = Flask(__name__)
-app.secret_key = "zeta_secret_key_2026"
-# ВАЖНО: Чтобы русские буквы отображались нормально, а не как \u...
-app.config['JSON_AS_ASCII'] = False
+
+# ИСПРАВЛЕНО: secret_key из .env или автогенерация
+_secret = os.getenv("ZETA_WEB_SECRET", "").strip()
+if not _secret:
+    _secret = secrets.token_hex(32)
+    logger.info("🔑 ZETA_WEB_SECRET не задан — сгенерирован временный ключ")
+app.secret_key = _secret
+
+# ИСПРАВЛЕНО: app.json.ensure_ascii (Flask 2.3+) вместо app.config['JSON_AS_ASCII']
+try:
+    app.json.ensure_ascii = False
+except AttributeError:
+    # Fallback для старых Flask
+    app.config["JSON_AS_ASCII"] = False
+
 CORS(app)
 
-# ========== HTML ==========
+
+# ========== RATE LIMITING (in-memory) ==========
+
+_rate_data: dict = defaultdict(list)
+_rate_lock = threading.Lock()
+
+
+def check_rate_limit(ip: str) -> bool:
+    """
+    ИСПРАВЛЕНО: простой rate limit.
+    Возвращает True, если запрос разрешён.
+    """
+    now = time.time()
+    with _rate_lock:
+        timestamps = _rate_data[ip]
+        # оставляем только за окно
+        timestamps[:] = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
+
+        if len(timestamps) >= RATE_LIMIT_MAX:
+            return False
+
+        timestamps.append(now)
+    return True
+
+
+def get_client_ip() -> str:
+    """Получить IP клиента (учитываем X-Forwarded-For)."""
+    try:
+        fwd = request.headers.get("X-Forwarded-For", "")
+        if fwd:
+            return fwd.split(",")[0].strip()
+        return request.remote_addr or "unknown"
+    except Exception:
+        return "unknown"
+
+
+# ========== HTML (без изменений) ==========
+
 HTML = """
 <!DOCTYPE html>
 <html lang="ru">
@@ -222,9 +310,8 @@ HTML = """
             display: none;
             font-size: 13px;
             color: var(--text-secondary);
+            margin: 0 20px 10px 20px;
         }
-        .typing-indicator .dots { display: inline-block; animation: dots 1.4s infinite; }
-        @keyframes dots { 0%, 20% { content: ''; } 40% { content: '.'; } 60% { content: '..'; } 80% { content: '...'; } }
         
         .input-container {
             background: var(--bg-secondary);
@@ -293,7 +380,7 @@ HTML = """
         <div class="header-left">
             <span class="header-logo">🤖</span>
             <span class="header-title">Zeta <span>Web</span></span>
-            <span class="header-badge">v2.0</span>
+            <span class="header-badge">v2.1</span>
         </div>
         <div class="header-right">
             <div class="header-status">
@@ -320,7 +407,7 @@ HTML = """
     </div>
 
     <div class="typing-indicator" id="typingIndicator">
-        🤔 Zeta думает<span class="dots">...</span>
+        🤔 Zeta думает...
     </div>
 
     <div class="input-container">
@@ -354,7 +441,6 @@ HTML = """
             const div = document.createElement('div');
             div.className = 'message ' + type;
             const senderHTML = type !== 'system' ? '<div class="sender">' + sender + '</div>' : '';
-            // ИСПРАВЛЕНО: Используем одиночный слеш для регулярного выражения в JS
             let textHTML = text.replace(/\\n/g, '<br>');
             textHTML = textHTML.replace(/```([\\s\\S]*?)```/g, '<pre><code>$1</code></pre>');
             div.innerHTML = senderHTML + '<div class="text">' + textHTML + '</div>';
@@ -408,7 +494,6 @@ HTML = """
                 addMessage('system', 'Система', '📭 Нет сообщений');
                 return;
             }
-            // ИСПРАВЛЕНО: Убираем лишние экранированные слеши
             let text = '📜 Экспорт чата Zeta\\n' + '='.repeat(40) + '\\n\\n';
             for (let msg of chatHistory) {
                 text += (msg.role === 'user' ? 'Вы' : 'Zeta') + ': ' + msg.content + '\\n\\n';
@@ -496,124 +581,184 @@ HTML = """
 
 # ========== МАРШРУТЫ ==========
 
-@app.route('/')
+@app.route("/")
 def index():
     return render_template_string(HTML)
 
 
-@app.route('/chat', methods=['POST'])
+@app.route("/health")
+def health():
+    """
+    ИСПРАВЛЕНО: простой health endpoint.
+    """
+    return jsonify({
+        "status": "ok",
+        "service": "Zeta Web",
+        "version": "2.1",
+        "time": time.time(),
+    })
+
+
+@app.route("/chat", methods=["POST"])
 def chat():
-    data = request.get_json()
-    user_message = data.get('message', '').strip()
-    if not user_message:
-        return jsonify({'error': 'Пустое сообщение'})
+    # Rate limiting
+    ip = get_client_ip()
+    if not check_rate_limit(ip):
+        logger.warning(f"Rate limit для {ip}")
+        return jsonify({"error": "Слишком много запросов. Подожди минуту."}), 429
+
     try:
+        data = request.get_json() or {}
+        user_message = (data.get("message") or "").strip()
+
+        if not user_message:
+            return jsonify({"error": "Пустое сообщение"})
+
+        # ИСПРАВЛЕНО: лимит длины
+        if len(user_message) > MAX_MESSAGE_LENGTH:
+            return jsonify({
+                "error": f"Сообщение слишком длинное (макс. {MAX_MESSAGE_LENGTH})"
+            })
+
+        logger.info(f"[/chat] {ip}: {user_message[:60]}...")
+
         response = ask_zeta_sync(user_message)
-        return jsonify({'response': response})
+        return jsonify({"response": response})
+
     except Exception as e:
-        # Исправление: возвращаем ошибку с русским текстом корректно
-        return jsonify({'error': str(e)})
+        # ИСПРАВЛЕНО: логируем стек, отдаём общий текст
+        logger.exception("Ошибка /chat")
+        return jsonify({"error": "Внутренняя ошибка. Проверь логи."}), 500
 
 
-@app.route('/clear', methods=['POST'])
+@app.route("/clear", methods=["POST"])
 def clear():
-    clear_history()
-    return jsonify({'status': 'ok'})
+    try:
+        clear_history()
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        logger.exception("Ошибка /clear")
+        return jsonify({"error": "Не удалось очистить."}), 500
 
 
-@app.route('/history')
+@app.route("/history")
 def history():
     try:
         history_list = get_history(limit=20)
         if not history_list:
-            return jsonify({'history': '📭 История пуста.'})
-        # ИСПРАВЛЕНО: заменяем \\n на \n
+            return jsonify({"history": "📭 История пуста."})
+
         text = "📜 **Последние сообщения:**\n\n"
         for msg in history_list[-10:]:
             role = "👤 Вы" if msg["role"] == "user" else "🤖 Z"
-            content = msg["content"][:200] + ("..." if len(msg["content"]) > 200 else "")
+            content = msg["content"][:200]
+            if len(msg["content"]) > 200:
+                content += "..."
             text += f"{role}: {content}\n"
-        return jsonify({'history': text})
+        return jsonify({"history": text})
     except Exception as e:
-        return jsonify({'error': str(e)})
+        logger.exception("Ошибка /history")
+        return jsonify({"error": "Не удалось получить историю."}), 500
 
 
-@app.route('/status')
+@app.route("/status")
 def status():
     try:
         status_text = get_system_status()
-        return jsonify({'status': status_text})
+        return jsonify({"status": status_text})
     except Exception as e:
-        return jsonify({'error': str(e)})
+        logger.exception("Ошибка /status")
+        return jsonify({"error": "Не удалось получить статус."}), 500
 
 
-@app.route('/facts')
+@app.route("/facts")
 def facts():
+    """
+    ИСПРАВЛЕНО: убран ручной фильтр settings_keys.
+    После фикса core/memory.py (SYSTEM_KEYS) настройки не попадают в факты.
+    """
     try:
         facts_list = get_facts()
-        
-        # ИСПРАВЛЕНО: Отфильтровываем технические настройки, которые не являются фактами
-        settings_keys = {"notif_interval", "disk_threshold", "ram_threshold", "cpu_threshold", 
-                         "smart_notifications", "max_tokens", "widget_opacity", "ai_temperature", 
-                         "project_path", "context_tokens", "ai_model", "tts_speed", "tts_voice"}
-        
-        filtered_facts = [f for f in facts_list if f['key'] not in settings_keys]
-        
-        if not filtered_facts:
-            return jsonify({'facts': '🧠 У меня пока нет фактов о вас.'})
-            
-        # ИСПРАВЛЕНО: заменяем \\n на \n
+        if not facts_list:
+            return jsonify({"facts": "🧠 У меня пока нет фактов о вас."})
+
         text = "🧠 **Факты о вас:**\n\n"
-        for fact in filtered_facts:
+        for fact in facts_list:
             text += f"• {fact['key']}: {fact['content']}\n"
-        return jsonify({'facts': text})
+        return jsonify({"facts": text})
     except Exception as e:
-        return jsonify({'error': str(e)})
+        logger.exception("Ошибка /facts")
+        return jsonify({"error": "Не удалось получить факты."}), 500
 
 
-@app.route('/clear_facts', methods=['POST'])
+@app.route("/clear_facts", methods=["POST"])
 def clear_facts():
     try:
-        facts = get_facts()
-        for fact in facts:
-            delete_fact(fact['key'])
-        return jsonify({'message': '🧹 Все факты очищены!'})
+        facts_list = get_facts()
+        for fact in facts_list:
+            delete_fact(fact["key"])
+        return jsonify({"message": "🧹 Все факты очищены!"})
     except Exception as e:
-        return jsonify({'error': str(e)})
+        logger.exception("Ошибка /clear_facts")
+        return jsonify({"error": "Не удалось очистить факты."}), 500
 
 
-@app.route('/screenshot')
+@app.route("/screenshot")
 def screenshot():
     try:
         img_base64 = take_screenshot()
         if not img_base64:
-            return jsonify({'error': 'Не удалось сделать скриншот'})
-        return jsonify({'image': img_base64})
+            return jsonify({"error": "Не удалось сделать скриншот"})
+        return jsonify({"image": img_base64})
     except Exception as e:
-        return jsonify({'error': str(e)})
+        logger.exception("Ошибка /screenshot")
+        return jsonify({"error": "Не удалось сделать скриншот."}), 500
 
 
 # ========== ЗАПУСК ==========
-def run_server(port=5000):
+
+def open_browser(port: int) -> None:
+    """
+    ИСПРАВЛЕНО: открытие через cmd /c start на Windows надёжнее.
+    """
+    time.sleep(2)
+    url = f"http://localhost:{port}"
+    try:
+        if os.name == "nt":
+            import subprocess
+            subprocess.Popen(
+                ["cmd", "/c", "start", url],
+                shell=False,
+            )
+        else:
+            webbrowser.open(url)
+    except Exception as e:
+        logger.warning(f"Не удалось открыть браузер: {e}")
+
+
+def run_server(port: int = 5000, open_browser_flag: bool = True) -> None:
     print(f"""
 ╔══════════════════════════════════════════════════════════╗
-║                    🌐 Zeta Web v2.0                     ║
+║                    🌐 Zeta Web v2.1                     ║
 ╠══════════════════════════════════════════════════════════╣
 ║  📱 Открой в браузере: http://localhost:{port}        ║
 ║  📱 С телефона: http://[IP-адрес]:{port}              ║
+║  🩺 Health-check:  http://localhost:{port}/health     ║
 ╚══════════════════════════════════════════════════════════╝
     """)
-    
-    # Функция для плавного открытия браузера
-    def open_browser():
-        time.sleep(2)
-        webbrowser.open(f'http://localhost:{port}')
 
-    # Открываем браузер в отдельном потоке, чтобы не блокировать Flask
-    threading.Thread(target=open_browser, daemon=True).start()
+    if open_browser_flag:
+        threading.Thread(target=open_browser, args=(port,), daemon=True).start()
 
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+    # ИСПРАВЛЕНО: threaded=True + use_reloader=False
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        threaded=True,
+        use_reloader=False,
+    )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     run_server()

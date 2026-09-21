@@ -1,7 +1,158 @@
-__pycache__/
-*.pyc
-data/
-*.db
+# ============================================================
+#  ZETA — .gitignore
+#  Все приватные данные НЕ попадают в GitHub
+# ============================================================
+
+# === СЕКРЕТЫ (КРИТИЧНО!) ===
+.env
+.env.*
+*.env
+!.env.example
+
+# === БАЗЫ ДАННЫХ ===
+data/*.db
+data/*.db-wal
+data/*.db-shm
+*.sqlite
+*.sqlite3
+
+# === КЭШ ===
+data/zeta_cache.db
+data/rag.db
+data/tts_cache.db
+data/rag_vectors/
+
+# === БЕЗОПАСНОСТЬ (КРИТИЧНО!) ===
+data/security/
+data/security/master.key
+data/security/auth.dat
+data/security/creator.dat
+data/security/2fa.dat
+*.key
+*.pem
+
+# === АУДИТ (личные логи) ===
+data/audit/
+data/audit/*.log
+data/audit/*.log.*
+
+# === ЛОГИ ===
+data/zeta.log
+data/zeta.log.*
+logs/
 *.log
+!data/.gitkeep
+
+# === БЭКАПЫ ===
+data/backups/
+data/backups/auto/
+data/backups/manual/
+
+# === СКРИНШОТЫ И ФОТО ===
+data/screenshots/
+data/images/
+data/avatar/
+*.jpg
+*.jpeg
+*.png
+*.gif
+!docs/*.png
+!docs/*.jpg
+!docs/*.gif
+!assets/*.png
+!assets/*.svg
+
+# === ПРАВИЛА АВТОМАТИЗАЦИИ (личные) ===
+data/automation.json
+data/browser_bookmarks.json
+data/browser_preference.json
+data/settings.json
+
+# === TTS КЭШ ===
+data/tts_cache/
+data/tts/*.mp3
+data/tts/*.wav
+
+# === КОНФИГИ БРАУЗЕРА ===
+data/browser_*.json
+
+# === PYTHON ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# === ВИРТУАЛЬНЫЕ ОКРУЖЕНИЯ ===
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# === OS ===
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === JUPYTER ===
+.ipynb_checkpoints/
+
+# === ПАКЕТЫ ===
+pip-wheel-metadata/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# === ДОКУМЕНТАЦИЯ (личное) ===
+Документация ZetaAI.txt
+ЗАМЕТКИ.txt
+TODO.txt
+*.personal
+
+# === АГЕНТ (локальные данные) ===
+agent_token.txt
+agent_config.json
+received/
+
+# === ТЕСТОВЫЕ ФАЙЛЫ ===
+test_rag.txt
+zeta_generated.py
+zeta_code.py
 generated/
-file.docx
+
+# === МОДЕЛИ (тяжёлые) ===
+*.gguf
+*.bin
+models/
+
+# === ЛОКАЛЬНЫЕ СКРИПТЫ ===
+*.local
+*.local.bat
+*_personal.bat

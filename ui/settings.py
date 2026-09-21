@@ -1,14 +1,28 @@
 # -*- coding: utf-8 -*-
+"""
+Окно настроек Zeta с вкладками и моментальным применением.
+
+ИСПРАВЛЕНО (2026-09-21):
+    - Убран scroll.setFixedSize (ломал скролл)
+    - Смена темы: пересоздание вкладок + refresh_audit после init_ui
+    - account_blocked читается из security.log (не auth.log)
+    - test_notification через публичную функцию
+    - reset_settings сбрасывает notif_check
+    - QDoubleSpinBox.setDecimals(1)
+    - on_theme_changed: refresh_audit вызывается после init_ui
+    - save_settings: убрано дублирующее сохранение темы
+"""
+
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QComboBox, QCheckBox, QFileDialog,
     QMessageBox, QScrollArea, QLineEdit, QSpinBox,
-    QDoubleSpinBox, QTabWidget, QGroupBox, QSlider
+    QDoubleSpinBox, QTabWidget, QGroupBox, QSlider,
+    QTextEdit
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
 from core.memory import save_setting, get_setting, clear_history, get_db_stats
-from modules.notifications import add_reminder, clear_reminders
 
 
 # ========== КАРТА ГОЛОСОВ ==========
@@ -52,79 +66,99 @@ class SettingsWindow(QWidget):
 
     settings_changed = pyqtSignal()
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.setWindowFlags(Qt.WindowType.Window)
-        self.setWindowTitle("⚙️ Настройки Z")
-        self.setFixedSize(550, 750)
+        self.setWindowTitle("⚙️ Настройки Zeta")
+        self.setMinimumSize(620, 780)
+        self.resize(620, 820)
+
         self.avatar_path = get_setting("avatar_path", "")
         self.theme_name = get_setting("theme", "dark")
         self.theme = THEMES.get(self.theme_name, THEMES["dark"])
-        self.setStyleSheet(f"background-color: {self.theme['bg']}; color: {self.theme['text']};")
+
+        # ИСПРАВЛЕНО: применяем фон через палитру, не через setStyleSheet на self
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAutoFillBackground(True)
+        self._apply_window_palette()
+
+        # Контейнер вкладок (создаётся в init_ui)
+        self.tabs: QTabWidget = None
+        self.scroll: QScrollArea = None
+        self.container: QWidget = None
 
         self.init_ui()
-        self.apply_theme()
+
+        # ИСПРАВЛЕНО: refresh_audit — ПОСЛЕ init_ui
+        try:
+            self.refresh_audit()
+        except Exception:
+            pass
+
+    # ========== ТЕМА ==========
+
+    def _apply_window_palette(self):
+        """ИСПРАВЛЕНО: жёстко фиксируем фон окна через палитру."""
+        from PyQt6.QtGui import QColor
+        pal = self.palette()
+        pal.setColor(self.backgroundRole(), QColor(self.theme['bg']))
+        self.setPalette(pal)
 
     def apply_theme(self):
         """Применяет тему к окну."""
-        self.setStyleSheet(f"background-color: {self.theme['bg']}; color: {self.theme['text']};")
+        self._apply_window_palette()
+        self.setStyleSheet(
+            f"QWidget {{ background-color: {self.theme['bg']}; color: {self.theme['text']}; }}"
+        )
 
     # ========== UI ==========
 
     def init_ui(self):
         """Создаёт интерфейс с вкладками."""
-        scroll = QScrollArea(self)
-        scroll.setWidgetResizable(True)
-        scroll.setStyleSheet(f"border: none; background: {self.theme['bg']};")
-        scroll.setFixedSize(550, 750)
+        # Если уже есть layout — очищаем
+        if self.layout() is not None:
+            old = self.layout()
+            QWidget().setLayout(old)
 
-        container = QWidget()
-        layout = QVBoxLayout(container)
+        # ИСПРАВЛЕНО: scroll без setFixedSize, с setWidgetResizable
+        self.scroll = QScrollArea(self)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.scroll.setStyleSheet(
+            f"QScrollArea {{ border: none; background: {self.theme['bg']}; }}"
+        )
+
+        self.container = QWidget()
+        layout = QVBoxLayout(self.container)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(10)
 
-        title = QLabel("⚙️ Настройки Z")
-        title.setStyleSheet(f"font-size: 22px; font-weight: bold; color: {self.theme['accent']};")
+        title = QLabel("⚙️ Настройки Zeta")
+        title.setStyleSheet(
+            f"font-size: 22px; font-weight: bold; color: {self.theme['accent']}; background: transparent;"
+        )
         layout.addWidget(title)
 
-        tabs = QTabWidget()
-        tabs.setStyleSheet(f"""
-            QTabWidget::pane {{
-                background: {self.theme['bg']};
-                border: 1px solid {self.theme['border']};
-                border-radius: 8px;
-                padding: 10px;
-            }}
-            QTabBar::tab {{
-                background: {self.theme['input']};
-                color: {self.theme['text']};
-                padding: 8px 16px;
-                border-radius: 8px 8px 0 0;
-                margin-right: 4px;
-            }}
-            QTabBar::tab:selected {{
-                background: {self.theme['accent']};
-                color: {self.theme['bg']};
-            }}
-            QTabBar::tab:hover {{
-                background: {self.theme['input']};
-            }}
-        """)
+        self.tabs = QTabWidget()
+        self._apply_tabs_style()
 
-        tabs.addTab(self._create_ui_tab(), "🎨 Внешний вид")
-        tabs.addTab(self._create_voice_tab(), "🔊 Голос")
-        tabs.addTab(self._create_ai_tab(), "🧠 ИИ")
-        tabs.addTab(self._create_notifications_tab(), "🔔 Уведомления")
-        tabs.addTab(self._create_animations_tab(), "✨ Анимации")
-        tabs.addTab(self._create_security_tab(), "🔒 Безопасность")
-        tabs.addTab(self._create_tools_tab(), "🛠️ Инструменты")
-        tabs.addTab(self._create_rag_tab(), "📄 RAG")
-        tabs.addTab(self._create_data_tab(), "🗄️ Данные")
+        self.tabs.addTab(self._create_ui_tab(), "🎨 Внешний вид")
+        self.tabs.addTab(self._create_voice_tab(), "🔊 Голос")
+        self.tabs.addTab(self._create_ai_tab(), "🧠 ИИ")
+        self.tabs.addTab(self._create_notifications_tab(), "🔔 Уведомления")
+        self.tabs.addTab(self._create_animations_tab(), "✨ Анимации")
+        self.tabs.addTab(self._create_security_tab(), "🔒 Безопасность")
+        self.tabs.addTab(self._create_audit_tab(), "📊 Аудит")
+        self.tabs.addTab(self._create_tools_tab(), "🛠️ Инструменты")
+        self.tabs.addTab(self._create_rag_tab(), "📄 RAG")
+        self.tabs.addTab(self._create_data_tab(), "🗄️ Данные")
 
-        layout.addWidget(tabs)
+        layout.addWidget(self.tabs)
 
         note = QLabel("Все изменения сохраняются автоматически! Нажмите 'Сохранить' для применения.")
-        note.setStyleSheet(f"color: {self.theme['text_secondary']}; font-size: 11px;")
+        note.setStyleSheet(
+            f"color: {self.theme['text_secondary']}; font-size: 11px; background: transparent;"
+        )
         note.setWordWrap(True)
         layout.addWidget(note)
 
@@ -147,17 +181,44 @@ class SettingsWindow(QWidget):
         btn_layout.addWidget(close_btn)
         layout.addLayout(btn_layout)
 
-        # Автор и версия
-        footer = QLabel("Zeta v3.0 — Создатель: Samriddin (Самир) 🇺🇿")
-        footer.setStyleSheet(f"color: {self.theme['text_secondary']}; font-size: 10px;")
+        footer = QLabel("Zeta v7.5 — Создатель: Samriddin (Самир) 🇺🇿")
+        footer.setStyleSheet(
+            f"color: {self.theme['text_secondary']}; font-size: 10px; background: transparent;"
+        )
         footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(footer)
 
-        scroll.setWidget(container)
+        self.scroll.setWidget(self.container)
 
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.addWidget(scroll)
+        main_layout.addWidget(self.scroll)
+
+    def _apply_tabs_style(self):
+        """Стиль QTabWidget (обновляется при смене темы)."""
+        self.tabs.setStyleSheet(f"""
+            QTabWidget::pane {{
+                background: {self.theme['bg']};
+                border: 1px solid {self.theme['border']};
+                border-radius: 8px;
+                padding: 10px;
+            }}
+            QTabBar::tab {{
+                background: {self.theme['input']};
+                color: {self.theme['text']};
+                padding: 8px 14px;
+                border-radius: 8px 8px 0 0;
+                margin-right: 3px;
+                font-size: 12px;
+            }}
+            QTabBar::tab:selected {{
+                background: {self.theme['accent']};
+                color: {self.theme['bg']};
+            }}
+            QTabBar::tab:hover {{
+                background: {self.theme['input']};
+            }}
+        """)
 
     # ========== ВКЛАДКА: ВНЕШНИЙ ВИД ==========
 
@@ -189,7 +250,9 @@ class SettingsWindow(QWidget):
         self.avatar_label = QLabel(
             self.avatar_path.split("/")[-1].split("\\")[-1] if self.avatar_path else "Не выбрана"
         )
-        self.avatar_label.setStyleSheet(f"color: {self.theme['text_secondary']}; font-size: 12px;")
+        self.avatar_label.setStyleSheet(
+            f"color: {self.theme['text_secondary']}; font-size: 12px; background: transparent;"
+        )
         av_btn = QPushButton("📁 Выбрать")
         av_btn.setStyleSheet(self._btn_secondary())
         av_btn.clicked.connect(self.choose_avatar)
@@ -198,7 +261,9 @@ class SettingsWindow(QWidget):
         layout.addLayout(av_layout)
 
         pos_label = QLabel("Виджет всегда в правом нижнем углу (перетаскивается мышью)")
-        pos_label.setStyleSheet(f"color: {self.theme['text_secondary']}; font-size: 11px;")
+        pos_label.setStyleSheet(
+            f"color: {self.theme['text_secondary']}; font-size: 11px; background: transparent;"
+        )
         pos_label.setWordWrap(True)
         layout.addWidget(pos_label)
 
@@ -211,7 +276,9 @@ class SettingsWindow(QWidget):
         layout.addWidget(self.opacity_slider)
 
         self.opacity_label = QLabel(f"{self.opacity_slider.value()}%")
-        self.opacity_label.setStyleSheet(f"color: {self.theme['text_secondary']}; font-size: 12px;")
+        self.opacity_label.setStyleSheet(
+            f"color: {self.theme['text_secondary']}; font-size: 12px; background: transparent;"
+        )
         layout.addWidget(self.opacity_label)
 
         layout.addStretch()
@@ -238,18 +305,33 @@ class SettingsWindow(QWidget):
         """
 
     def on_theme_changed(self, value: str):
+        """
+        ИСПРАВЛЕНО: при смене темы пересоздаём UI + вызываем refresh_audit.
+        Без refresh_audit вкладка «📊 Аудит» остаётся пустой после смены темы.
+        """
         save_setting("theme", value)
-        self.settings_changed.emit()
         self.theme_name = value
         self.theme = THEMES.get(value, THEMES["dark"])
-        self.apply_theme()
-        self.refresh_style()
 
-    def refresh_style(self):
-        """Обновляет стили после смены темы."""
-        self.setStyleSheet(f"background-color: {self.theme['bg']}; color: {self.theme['text']};")
-        self.title_label.setStyleSheet(f"color: {self.theme['accent']};")
-        # Можно добавить обновление остальных элементов
+        # Сохраняем текущую вкладку, чтобы вернуться на неё
+        current_index = self.tabs.currentIndex() if self.tabs else 0
+
+        # Пересоздаём UI
+        self.init_ui()
+
+        # ИСПРАВЛЕНО: обновляем аудит после пересоздания вкладок
+        try:
+            self.refresh_audit()
+        except Exception:
+            pass
+
+        # Возвращаемся на ту же вкладку
+        try:
+            self.tabs.setCurrentIndex(current_index)
+        except Exception:
+            pass
+
+        self.settings_changed.emit()
 
     def on_size_changed(self, value: str):
         save_setting("widget_size", value)
@@ -271,7 +353,9 @@ class SettingsWindow(QWidget):
 
         self.voice_check = QCheckBox("Голос включён")
         self.voice_check.setChecked(get_setting("voice_enabled", "true") == "true")
-        self.voice_check.setStyleSheet(f"color: {self.theme['text']}; font-size: 13px;")
+        self.voice_check.setStyleSheet(
+            f"color: {self.theme['text']}; font-size: 13px; background: transparent;"
+        )
         self.voice_check.toggled.connect(self.on_voice_toggled)
         layout.addWidget(self.voice_check)
 
@@ -336,7 +420,7 @@ class SettingsWindow(QWidget):
         layout.addWidget(self._label("Модель ИИ (чат):"))
         self.model_combo = QComboBox()
         self.model_combo.addItems(list(MODEL_MAP.keys()))
-        saved_model = get_setting("ai_model", "qwen2.5:7b")
+        saved_model = get_setting("ai_model", "zeta-universal")
         for name, code in MODEL_MAP.items():
             if code == saved_model:
                 self.model_combo.setCurrentText(name)
@@ -358,6 +442,8 @@ class SettingsWindow(QWidget):
         self.temp_spin = QDoubleSpinBox()
         self.temp_spin.setRange(0.1, 2.0)
         self.temp_spin.setSingleStep(0.1)
+        # ИСПРАВЛЕНО: 1 знак после запятой
+        self.temp_spin.setDecimals(1)
         self.temp_spin.setValue(float(get_setting("ai_temperature", "0.7")))
         self.temp_spin.setStyleSheet(self._spin_style())
         self.temp_spin.valueChanged.connect(self.on_temperature_changed)
@@ -376,7 +462,7 @@ class SettingsWindow(QWidget):
         return widget
 
     def on_model_changed(self, value: str):
-        model_code = MODEL_MAP.get(value, "qwen2.5:7b")
+        model_code = MODEL_MAP.get(value, "zeta-universal")
         save_setting("ai_model", model_code)
         self.settings_changed.emit()
 
@@ -400,7 +486,9 @@ class SettingsWindow(QWidget):
 
         self.notif_check = QCheckBox("Умные уведомления включены")
         self.notif_check.setChecked(get_setting("smart_notifications", "true") == "true")
-        self.notif_check.setStyleSheet(f"color: {self.theme['text']}; font-size: 13px;")
+        self.notif_check.setStyleSheet(
+            f"color: {self.theme['text']}; font-size: 13px; background: transparent;"
+        )
         self.notif_check.toggled.connect(self.on_notif_toggled)
         layout.addWidget(self.notif_check)
 
@@ -461,15 +549,22 @@ class SettingsWindow(QWidget):
         save_setting("notif_interval", str(value))
 
     def test_notification(self):
-        """Тест уведомления."""
+        """
+        ИСПРАВЛЕНО: используем публичную функцию из smart_notifier.
+        """
         try:
-            from modules.smart_notifier import _notifier
-            _notifier._notify("🔔 Тест уведомления", "Это тестовое уведомление от Zeta!")
-            QMessageBox.information(self, "Готово", "Тестовое уведомление отправлено!")
+            from modules.smart_notifier import show_test_notification
+            ok = show_test_notification()
+            if ok:
+                QMessageBox.information(self, "Готово", "Тестовое уведомление отправлено!")
+            else:
+                QMessageBox.warning(
+                    self, "Ошибка",
+                    "Не удалось отправить уведомление.\n"
+                    "Проверьте, что функция show_notification доступна."
+                )
         except ImportError:
             QMessageBox.warning(self, "Ошибка", "Модуль smart_notifier не найден.")
-        except AttributeError:
-            QMessageBox.warning(self, "Ошибка", "Ошибка в модуле smart_notifier. Проверьте установку.")
         except Exception as e:
             QMessageBox.warning(self, "Ошибка", f"Не удалось отправить уведомление: {e}")
 
@@ -484,7 +579,9 @@ class SettingsWindow(QWidget):
 
         self.anim_check = QCheckBox("Плавные анимации включены")
         self.anim_check.setChecked(get_setting("animations_enabled", "true") == "true")
-        self.anim_check.setStyleSheet(f"color: {self.theme['text']}; font-size: 13px;")
+        self.anim_check.setStyleSheet(
+            f"color: {self.theme['text']}; font-size: 13px; background: transparent;"
+        )
         self.anim_check.toggled.connect(self.on_animations_toggled)
         layout.addWidget(self.anim_check)
 
@@ -531,13 +628,17 @@ class SettingsWindow(QWidget):
 
         self.safety_check = QCheckBox("Защита от токсичных ответов")
         self.safety_check.setChecked(get_setting("safety_enabled", "true") == "true")
-        self.safety_check.setStyleSheet(f"color: {self.theme['text']}; font-size: 13px;")
+        self.safety_check.setStyleSheet(
+            f"color: {self.theme['text']}; font-size: 13px; background: transparent;"
+        )
         self.safety_check.toggled.connect(self.on_safety_toggled)
         layout.addWidget(self.safety_check)
 
         self.git_protection_check = QCheckBox("Защита от опасных Git-команд")
         self.git_protection_check.setChecked(get_setting("git_protection_enabled", "true") == "true")
-        self.git_protection_check.setStyleSheet(f"color: {self.theme['text']}; font-size: 13px;")
+        self.git_protection_check.setStyleSheet(
+            f"color: {self.theme['text']}; font-size: 13px; background: transparent;"
+        )
         self.git_protection_check.toggled.connect(self.on_git_protection_toggled)
         layout.addWidget(self.git_protection_check)
 
@@ -562,6 +663,215 @@ class SettingsWindow(QWidget):
     def on_max_query_changed(self, value: int):
         save_setting("max_query_length", str(value))
 
+    # ========== ВКЛАДКА: АУДИТ ==========
+
+    def _create_audit_tab(self) -> QWidget:
+        """Вкладка аудита безопасности."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(12)
+
+        layout.addWidget(self._section("📊 Аудит безопасности"))
+
+        # === СВОДКА ===
+        layout.addWidget(self._label("Сводка событий:"))
+        self.audit_summary = QLabel("Загрузка...")
+        self.audit_summary.setStyleSheet(
+            f"color: {self.theme['text']}; "
+            f"background: {self.theme['input']}; "
+            f"padding: 10px; border-radius: 6px; "
+            f"font-size: 12px;"
+        )
+        self.audit_summary.setWordWrap(True)
+        layout.addWidget(self.audit_summary)
+
+        # === АЛЕРТЫ IDS ===
+        layout.addWidget(self._label("🚨 Алерты IDS:"))
+        self.audit_alerts = QTextEdit()
+        self.audit_alerts.setReadOnly(True)
+        self.audit_alerts.setMaximumHeight(100)
+        self.audit_alerts.setStyleSheet(
+            f"color: {self.theme['text']}; "
+            f"background: {self.theme['input']}; "
+            f"border: none; border-radius: 6px; "
+            f"padding: 8px; font-size: 11px; "
+            f"font-family: Consolas;"
+        )
+        layout.addWidget(self.audit_alerts)
+
+        # === ПОСЛЕДНИЕ ВХОДЫ ===
+        layout.addWidget(self._label("🔐 Последние входы:"))
+        self.audit_logins = QTextEdit()
+        self.audit_logins.setReadOnly(True)
+        self.audit_logins.setMaximumHeight(120)
+        self.audit_logins.setStyleSheet(
+            f"color: {self.theme['text']}; "
+            f"background: {self.theme['input']}; "
+            f"border: none; border-radius: 6px; "
+            f"padding: 8px; font-size: 11px; "
+            f"font-family: Consolas;"
+        )
+        layout.addWidget(self.audit_logins)
+
+        # === КНОПКИ ===
+        btn_layout = QHBoxLayout()
+
+        refresh_btn = QPushButton("🔄 Обновить")
+        refresh_btn.setStyleSheet(self._btn_secondary())
+        refresh_btn.clicked.connect(self.refresh_audit)
+        btn_layout.addWidget(refresh_btn)
+
+        export_btn = QPushButton("📤 Экспорт")
+        export_btn.setStyleSheet(self._btn_secondary())
+        export_btn.clicked.connect(self.export_audit)
+        btn_layout.addWidget(export_btn)
+
+        clear_btn = QPushButton("🧹 Очистить")
+        clear_btn.setStyleSheet(self._btn_danger())
+        clear_btn.clicked.connect(self.clear_audit)
+        btn_layout.addWidget(clear_btn)
+
+        layout.addLayout(btn_layout)
+        layout.addStretch()
+
+        return widget
+
+    def refresh_audit(self):
+        """
+        ИСПРАВЛЕНО:
+            - Проверка на существование виджетов
+            - account_blocked ищется в security.log, а не auth.log
+        """
+        # ИСПРАВЛЕНО: защита от вызова до создания виджетов
+        if not hasattr(self, "audit_summary"):
+            return
+
+        try:
+            from security.audit import get_audit
+            from security.intrusion_detector import get_ids
+
+            audit = get_audit()
+            stats = audit.get_stats()
+
+            # === СВОДКА ===
+            summary_text = (
+                f"📊 Всего событий:\n"
+                f"   💬 Команды:     {stats.get('commands', 0)}\n"
+                f"   🔐 Входы:       {stats.get('auth', 0)}\n"
+                f"   🔀 Git:         {stats.get('git', 0)}\n"
+                f"   🚨 Безопасность: {stats.get('security', 0)}\n"
+                f"   ⚙️ Система:     {stats.get('system', 0)}\n"
+                f"   ❌ Ошибки:      {stats.get('errors', 0)}"
+            )
+            self.audit_summary.setText(summary_text)
+
+            # === АЛЕРТЫ IDS ===
+            ids = get_ids()
+            alerts = ids.get_alerts(limit=5)
+
+            if alerts:
+                alerts_text = ""
+                for a in alerts:
+                    sev = a.get("severity", "?")
+                    msg = a.get("message", "?")
+                    alerts_text += f"[{sev:8s}] {msg}\n"
+                self.audit_alerts.setPlainText(alerts_text)
+            else:
+                self.audit_alerts.setPlainText("✅ Алертов нет")
+
+            # === ВХОДЫ + БЛОКИРОВКИ ===
+            logins_text = ""
+
+            # 1. Логины из auth.log
+            logins = audit.read_log("auth", limit=20)
+            for entry in logins:
+                etype = entry.get("type", "")
+                ts = entry.get("timestamp", "")[11:19]
+
+                if etype == "login":
+                    success = "✅" if entry.get("success") else "❌"
+                    attempts = entry.get("attempts", "?")
+                    logins_text += f"{ts}  {success}  вход (попытка {attempts})\n"
+                elif etype == "logout":
+                    logins_text += f"{ts}  👋 выход\n"
+
+            # 2. Блокировки из security.log (ИСПРАВЛЕНО)
+            security_entries = audit.read_log("security", limit=30)
+            for entry in security_entries:
+                event = entry.get("event", "")
+                ts = entry.get("timestamp", "")[11:19]
+
+                if event == "account_blocked":
+                    logins_text += f"{ts}  ⛔ БЛОКИРОВКА\n"
+
+            self.audit_logins.setPlainText(logins_text or "(нет данных)")
+
+        except Exception as e:
+            if hasattr(self, "audit_summary"):
+                self.audit_summary.setText(f"Ошибка: {e}")
+            if hasattr(self, "audit_alerts"):
+                self.audit_alerts.setPlainText("—")
+            if hasattr(self, "audit_logins"):
+                self.audit_logins.setPlainText("—")
+
+    def export_audit(self):
+        """Экспорт аудита в JSON."""
+        try:
+            import json
+            from security.audit import get_audit
+            from security.intrusion_detector import get_ids
+
+            audit = get_audit()
+
+            data = {
+                "stats": audit.get_stats(),
+                "commands": audit.read_log("commands", limit=100),
+                "auth": audit.read_log("auth", limit=100),
+                "git": audit.read_log("git", limit=100),
+                "security": audit.read_log("security", limit=100),
+                "alerts": get_ids().get_alerts(limit=50),
+            }
+
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Сохранить аудит", "zeta_audit.json", "JSON (*.json)"
+            )
+            if path:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                QMessageBox.information(self, "Готово", f"Аудит сохранён в:\n{path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Ошибка", f"Не удалось экспортировать: {e}")
+
+    def clear_audit(self):
+        """Очистить все логи аудита."""
+        reply = QMessageBox.question(
+            self,
+            "Подтверждение",
+            "Удалить ВСЕ логи аудита?\n\n"
+            "Это включает:\n"
+            "• Команды\n"
+            "• Входы\n"
+            "• Git\n"
+            "• Безопасность\n"
+            "• Система\n"
+            "• Ошибки\n\n"
+            "Действие необратимо!",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                from security.audit import get_audit
+                from security.intrusion_detector import get_ids
+
+                count = get_audit().clear_all()
+                get_ids().clear_alerts()
+
+                QMessageBox.information(self, "Готово", f"Очищено {count} логов.")
+                self.refresh_audit()
+            except Exception as e:
+                QMessageBox.warning(self, "Ошибка", f"Не удалось очистить: {e}")
+
     # ========== ВКЛАДКА: ИНСТРУМЕНТЫ ==========
 
     def _create_tools_tab(self) -> QWidget:
@@ -571,19 +881,21 @@ class SettingsWindow(QWidget):
 
         layout.addWidget(self._section("🛠️ Инструменты"))
 
-        # Очистка кеша
         self.clear_cache_btn = QPushButton("🧹 Очистить кеш")
         self.clear_cache_btn.setStyleSheet(self._btn_secondary())
         self.clear_cache_btn.clicked.connect(self.clear_cache)
         layout.addWidget(self.clear_cache_btn)
 
-        # Резервное копирование
         self.backup_btn = QPushButton("💾 Создать резервную копию БД")
         self.backup_btn.setStyleSheet(self._btn_secondary())
         self.backup_btn.clicked.connect(self.backup_db)
         layout.addWidget(self.backup_btn)
 
-        # Очистка напоминаний
+        self.backup_now_btn = QPushButton("🚀 Создать полный бэкап (в auto/)")
+        self.backup_now_btn.setStyleSheet(self._btn_primary())
+        self.backup_now_btn.clicked.connect(self.create_full_backup)
+        layout.addWidget(self.backup_now_btn)
+
         self.clear_reminders_btn = QPushButton("🗑️ Очистить напоминания")
         self.clear_reminders_btn.setStyleSheet(self._btn_danger())
         self.clear_reminders_btn.clicked.connect(self.clear_reminders)
@@ -593,7 +905,6 @@ class SettingsWindow(QWidget):
         return widget
 
     def clear_cache(self):
-        """Очищает кеш."""
         try:
             import sqlite3
             from core.ai_engine import CACHE_DB
@@ -606,7 +917,6 @@ class SettingsWindow(QWidget):
             QMessageBox.warning(self, "Ошибка", f"Не удалось очистить кеш: {e}")
 
     def backup_db(self):
-        """Создаёт резервную копию БД."""
         try:
             from core.memory import DB_PATH
             import shutil
@@ -622,9 +932,21 @@ class SettingsWindow(QWidget):
         except Exception as e:
             QMessageBox.warning(self, "Ошибка", f"Не удалось создать копию: {e}")
 
-    def clear_reminders(self):
-        """Очищает напоминания."""
+    def create_full_backup(self):
+        """Создать полный бэкап (data/backups/auto/)."""
         try:
+            from security.backup import get_backup
+            ok, path = get_backup().create(auto=True, name="manual")
+            if ok:
+                QMessageBox.information(self, "Готово", f"Бэкап создан:\n{path}")
+            else:
+                QMessageBox.warning(self, "Ошибка", f"Не удалось создать бэкап: {path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Ошибка", f"Ошибка бэкапа: {e}")
+
+    def clear_reminders(self):
+        try:
+            from modules.notifications import clear_reminders
             clear_reminders()
             QMessageBox.information(self, "Готово", "Напоминания очищены.")
         except Exception as e:
@@ -641,7 +963,9 @@ class SettingsWindow(QWidget):
 
         self.rag_check = QCheckBox("RAG включён")
         self.rag_check.setChecked(get_setting("rag_enabled", "true") == "true")
-        self.rag_check.setStyleSheet(f"color: {self.theme['text']}; font-size: 13px;")
+        self.rag_check.setStyleSheet(
+            f"color: {self.theme['text']}; font-size: 13px; background: transparent;"
+        )
         self.rag_check.toggled.connect(self.on_rag_toggled)
         layout.addWidget(self.rag_check)
 
@@ -669,7 +993,6 @@ class SettingsWindow(QWidget):
         save_setting("rag_max_results", str(value))
 
     def clear_rag_documents(self):
-        """Очищает документы RAG."""
         try:
             from modules.rag import clear_all_documents
             clear_all_documents()
@@ -688,9 +1011,13 @@ class SettingsWindow(QWidget):
 
         stats = get_db_stats()
         self.stats_label = QLabel(
-            f"💬 Сообщений: {stats.get('messages', 0)}  |  🧠 Фактов: {stats.get('facts', 0)}  |  ⚙️ Настроек: {stats.get('settings', 0)}"
+            f"💬 Сообщений: {stats.get('messages', 0)}  |  "
+            f"🧠 Фактов: {stats.get('facts', 0)}  |  "
+            f"⚙️ Настроек: {stats.get('settings', 0)}"
         )
-        self.stats_label.setStyleSheet(f"color: {self.theme['text_secondary']}; font-size: 12px; padding: 4px;")
+        self.stats_label.setStyleSheet(
+            f"color: {self.theme['text_secondary']}; font-size: 12px; padding: 4px; background: transparent;"
+        )
         layout.addWidget(self.stats_label)
 
         refresh_btn = QPushButton("🔄 Обновить статистику")
@@ -731,12 +1058,18 @@ class SettingsWindow(QWidget):
 
     def _section(self, text: str) -> QLabel:
         lbl = QLabel(text)
-        lbl.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {self.theme['accent']}; margin-top: 4px;")
+        lbl.setStyleSheet(
+            f"font-size: 14px; font-weight: bold; color: {self.theme['accent']}; "
+            f"margin-top: 4px; background: transparent;"
+        )
         return lbl
 
     def _label(self, text: str) -> QLabel:
         lbl = QLabel(text)
-        lbl.setStyleSheet(f"color: {self.theme['text_secondary']}; font-size: 12px; margin-top: 4px;")
+        lbl.setStyleSheet(
+            f"color: {self.theme['text_secondary']}; font-size: 12px; "
+            f"margin-top: 4px; background: transparent;"
+        )
         return lbl
 
     def _combo_style(self):
@@ -806,20 +1139,20 @@ class SettingsWindow(QWidget):
                 padding: 8px 14px;
                 border: none;
             }}
-            QPushButton:hover {{ background: {self.theme['input']}; }}
+            QPushButton:hover {{ background: {self.theme['border']}; }}
         """
 
     def _btn_danger(self):
         return f"""
             QPushButton {{
                 background: {self.theme['input']};
-                color: {self.theme['accent']};
+                color: #ff3860;
                 border-radius: 8px;
                 padding: 8px 14px;
-                border: 1px solid {self.theme['accent']};
+                border: 1px solid #ff3860;
             }}
             QPushButton:hover {{
-                background: {self.theme['accent']};
+                background: #ff3860;
                 color: {self.theme['bg']};
             }}
         """
@@ -837,9 +1170,13 @@ class SettingsWindow(QWidget):
             self.settings_changed.emit()
 
     def refresh_stats(self):
+        if not hasattr(self, "stats_label"):
+            return
         stats = get_db_stats()
         self.stats_label.setText(
-            f"💬 Сообщений: {stats.get('messages', 0)}  |  🧠 Фактов: {stats.get('facts', 0)}  |  ⚙️ Настроек: {stats.get('settings', 0)}"
+            f"💬 Сообщений: {stats.get('messages', 0)}  |  "
+            f"🧠 Фактов: {stats.get('facts', 0)}  |  "
+            f"⚙️ Настроек: {stats.get('settings', 0)}"
         )
 
     def clear_chat_history(self):
@@ -861,12 +1198,8 @@ class SettingsWindow(QWidget):
         )
         if reply == QMessageBox.StandardButton.Yes:
             try:
-                import sqlite3
-                from core.memory import DB_PATH
-                conn = sqlite3.connect(DB_PATH)
-                conn.execute("DELETE FROM facts")
-                conn.commit()
-                conn.close()
+                from core.memory import clear_facts as _clear_facts
+                _clear_facts()
                 self.refresh_stats()
                 QMessageBox.information(self, "Готово", "Факты очищены.")
             except Exception as e:
@@ -904,36 +1237,61 @@ class SettingsWindow(QWidget):
             "Сбросить все настройки к значениям по умолчанию?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
-        if reply == QMessageBox.StandardButton.Yes:
-            self.theme_combo.setCurrentText("dark")
-            self.size_combo.setCurrentText("M")
-            self.voice_check.setChecked(True)
-            self.tts_voice_combo.setCurrentText("Светлана (женский, RU)")
-            self.speed_spin.setValue(5)
-            self.model_combo.setCurrentText("qwen2.5:7b (рекомендуется)")
-            self.context_spin.setValue(2000)
-            self.project_path_input.setText("D:\\Zeta")
-            self.opacity_slider.setValue(100)
-            self.avatar_path = ""
-            self.avatar_label.setText("Не выбрана")
-            self.temp_spin.setValue(0.7)
-            self.max_tokens_spin.setValue(1024)
-            self.cpu_threshold_spin.setValue(80)
-            self.ram_threshold_spin.setValue(85)
-            self.disk_threshold_spin.setValue(90)
-            self.interval_spin.setValue(30)
-            self.anim_check.setChecked(True)
-            self.anim_speed_spin.setValue(300)
-            self.anim_effect_combo.setCurrentText("Fade In")
-            self.safety_check.setChecked(True)
-            self.git_protection_check.setChecked(True)
-            self.max_query_spin.setValue(2000)
-            self.rag_check.setChecked(True)
-            self.rag_results_spin.setValue(5)
-            QMessageBox.information(self, "Готово", "Настройки сброшены. Нажмите 'Сохранить', чтобы применить.")
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Внешний вид
+        self.theme_combo.setCurrentText("dark")
+        self.size_combo.setCurrentText("M")
+        self.opacity_slider.setValue(100)
+        self.avatar_path = ""
+        self.avatar_label.setText("Не выбрана")
+
+        # Голос
+        self.voice_check.setChecked(True)
+        self.tts_voice_combo.setCurrentText("Светлана (женский, RU)")
+        self.speed_spin.setValue(5)
+
+        # ИИ
+        self.model_combo.setCurrentText("zeta-universal (ТВОЯ МОДЕЛЬ!)")
+        self.context_spin.setValue(2000)
+        self.temp_spin.setValue(0.7)
+        self.max_tokens_spin.setValue(1024)
+
+        # Уведомления — ИСПРАВЛЕНО: добавляем сброс notif_check
+        self.notif_check.setChecked(True)
+        self.cpu_threshold_spin.setValue(80)
+        self.ram_threshold_spin.setValue(85)
+        self.disk_threshold_spin.setValue(90)
+        self.interval_spin.setValue(30)
+
+        # Анимации
+        self.anim_check.setChecked(True)
+        self.anim_speed_spin.setValue(300)
+        self.anim_effect_combo.setCurrentText("Fade In")
+
+        # Безопасность
+        self.safety_check.setChecked(True)
+        self.git_protection_check.setChecked(True)
+        self.max_query_spin.setValue(2000)
+
+        # RAG
+        self.rag_check.setChecked(True)
+        self.rag_results_spin.setValue(5)
+
+        # Данные
+        self.project_path_input.setText("D:\\Zeta")
+
+        QMessageBox.information(
+            self, "Готово",
+            "Настройки сброшены. Нажмите 'Сохранить', чтобы применить."
+        )
 
     def save_settings(self):
-        save_setting("theme", self.theme_combo.currentText())
+        """
+        ИСПРАВЛЕНО: убрано дублирующее сохранение theme —
+        оно уже сохраняется в on_theme_changed.
+        """
         save_setting("voice_enabled", "true" if self.voice_check.isChecked() else "false")
         save_setting("widget_size", self.size_combo.currentText())
         save_setting("avatar_path", self.avatar_path)
@@ -945,7 +1303,7 @@ class SettingsWindow(QWidget):
         save_setting("tts_speed", str(self.speed_spin.value()))
 
         model_display = self.model_combo.currentText()
-        model_code = MODEL_MAP.get(model_display, "qwen2.5:7b")
+        model_code = MODEL_MAP.get(model_display, "zeta-universal")
         save_setting("ai_model", model_code)
         save_setting("context_tokens", str(self.context_spin.value()))
         save_setting("ai_temperature", str(self.temp_spin.value()))
@@ -971,5 +1329,8 @@ class SettingsWindow(QWidget):
         save_setting("rag_max_results", str(self.rag_results_spin.value()))
 
         self.settings_changed.emit()
-        QMessageBox.information(self, "Готово", "Настройки сохранены!\nПерезапустите Z для применения.")
+        QMessageBox.information(
+            self, "Готово",
+            "Настройки сохранены!\nПерезапустите Zeta для применения."
+        )
         self.close()
