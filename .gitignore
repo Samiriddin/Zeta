@@ -156,3 +156,30 @@ models/
 *.local
 *.local.bat
 *_personal.bat
+# === ДАННЫЕ ===
+data/
+!data/.gitkeep
+
+# === ТЕСТЫ ===
+test_zeta.py
+test_*.py
+!test_ids.py    # (если нужен)
+
+# === УСТАРЕВШИЕ ===
+update_zeta.bat
+zeta_generated.py
+Документация ZetaAI.txt
+
+# ============================================================
+#  ДОПОЛНЕНИЕ (2026-09-22)
+# ============================================================
+
+# Данные и тесты
+data/
+test_zeta.py
+test_*.py
+
+# Устаревшие файлы
+update_zeta.bat
+zeta_generated.py
+Документация ZetaAI.txt
