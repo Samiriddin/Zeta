@@ -1,0 +1,50 @@
+{
+    "name": "Zeta — ИИ-ассистент",
+    "short_name": "Zeta",
+    "description": "Локальный ИИ-ассистент с характером, голосом и управлением ПК. Создан в Узбекистане 🇺🇿",
+    "start_url": "./index.html",
+    "display": "standalone",
+    "orientation": "portrait",
+    "background_color": "#030817",
+    "theme_color": "#030817",
+    "lang": "ru",
+    "dir": "ltr",
+    "scope": "./",
+    "categories": ["productivity", "utilities", "artificial intelligence"],
+    "icons": [
+        {
+            "src": "icon-192.png",
+            "sizes": "192x192",
+            "type": "image/png",
+            "purpose": "any"
+        },
+        {
+            "src": "icon-512.png",
+            "sizes": "512x512",
+            "type": "image/png",
+            "purpose": "any"
+        },
+        {
+            "src": "icon-512.png",
+            "sizes": "512x512",
+            "type": "image/png",
+            "purpose": "maskable"
+        }
+    ],
+    "shortcuts": [
+        {
+            "name": "Чат",
+            "short_name": "Чат",
+            "description": "Открыть чат с Zeta",
+            "url": "./index.html#chat",
+            "icons": [{ "src": "icon-192.png", "sizes": "192x192" }]
+        },
+        {
+            "name": "Статус",
+            "short_name": "Статус",
+            "description": "Статус системы",
+            "url": "./index.html#status",
+            "icons": [{ "src": "icon-192.png", "sizes": "192x192" }]
+        }
+    ]
+}

@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="theme-color" content="#030817">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Zeta">
+    <meta name="description" content="Zeta — локальный ИИ-ассистент с характером, голосом и управлением ПК. Made in Uzbekistan 🇺🇿">
+
+    <title>Zeta — ИИ-ассистент</title>
+
+    <link rel="manifest" href="manifest.json">
+    <link rel="icon" type="image/png" href="icon-192.png">
+    <link rel="apple-touch-icon" href="icon-192.png">
+
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+    <!-- ЭКРАН 1: ЧАТ -->
+    <div class="screen" id="screen-chat">
+        <header class="header">
+            <div class="header-left">
+                <div class="logo">Z</div>
+                <div class="header-info">
+                    <div class="title">Zeta</div>
+                    <div class="status"><span class="dot"></span>Онлайн</div>
+                </div>
+            </div>
+            <button class="icon-btn" id="btn-theme" aria-label="Тема">🌓</button>
+        </header>
+
+        <main class="chat" id="chat"></main>
+
+        <div class="typing" id="typing" hidden>
+            <span></span><span></span><span></span>
+        </div>
+
+        <footer class="input-bar">
+            <button class="icon-btn" id="btn-mic" aria-label="Микрофон">🎤</button>
+            <input type="text" id="input" placeholder="Напиши что-нибудь..." autocomplete="off">
+            <button class="send-btn" id="btn-send" aria-label="Отправить">➤</button>
+        </footer>
+    </div>
+
+    <!-- ЭКРАН 2: СТАТУС -->
+    <div class="screen" id="screen-status" hidden>
+        <header class="header">
+            <div class="header-left">
+                <button class="icon-btn" data-back>←</button>
+                <div class="title">Статус</div>
+            </div>
+        </header>
+        <main class="content">
+            <div class="card">
+                <div class="card-title">💻 CPU</div>
+                <div class="progress"><div class="progress-fill" style="width: 35%"></div></div>
+                <div class="card-value">35%</div>
+            </div>
+            <div class="card">
+                <div class="card-title">🧠 RAM</div>
+                <div class="progress"><div class="progress-fill" style="width: 62%"></div></div>
+                <div class="card-value">62%</div>
+            </div>
+            <div class="card">
+                <div class="card-title">💾 Диск</div>
+                <div class="progress"><div class="progress-fill" style="width: 48%"></div></div>
+                <div class="card-value">48%</div>
+            </div>
+            <div class="card">
+                <div class="card-title">⏱️ Время работы</div>
+                <div class="card-value big">3д 5ч 42м</div>
+            </div>
+            <p class="note">⚠️ Это демо-данные. В реальной версии — живые с ПК.</p>
+        </main>
+    </div>
+
+    <!-- ЭКРАН 3: НАСТРОЙКИ -->
+    <div class="screen" id="screen-settings" hidden>
+        <header class="header">
+            <div class="header-left">
+                <button class="icon-btn" data-back>←</button>
+                <div class="title">Настройки</div>
+            </div>
+        </header>
+        <main class="content">
+            <div class="setting">
+                <label>Тема</label>
+                <select id="theme-select">
+                    <option value="dark">Тёмная</option>
+                    <option value="light">Светлая</option>
+                </select>
+            </div>
+            <div class="setting">
+                <label>Язык</label>
+                <select id="lang-select">
+                    <option value="ru">Русский</option>
+                    <option value="uz">O'zbekcha</option>
+                    <option value="en">English</option>
+                </select>
+            </div>
+            <div class="setting">
+                <label>Размер шрифта</label>
+                <input type="range" id="font-size" min="12" max="20" value="15">
+                <span id="font-size-value">15px</span>
+            </div>
+            <p class="note">💾 Настройки сохраняются в браузере</p>
+        </main>
+    </div>
+
+    <!-- ЭКРАН 4: О ПРИЛОЖЕНИИ -->
+    <div class="screen" id="screen-about" hidden>
+        <header class="header">
+            <div class="header-left">
+                <button class="icon-btn" data-back>←</button>
+                <div class="title">О Zeta</div>
+            </div>
+        </header>
+        <main class="content center">
+            <div class="big-logo">Z</div>
+            <h1>Zeta</h1>
+            <p class="version">v7.5 — Security + Automation + Devices</p>
+            <p class="desc">
+                Локальный ИИ-ассистент с характером, голосом, зрением
+                и управлением ПК.
+            </p>
+            <p class="made">Создано в Узбекистане 🇺🇿</p>
+            <a href="https://github.com/Samiriddin/Zeta" class="link-btn" target="_blank">GitHub →</a>
+        </main>
+    </div>
+
+    <!-- НИЖНЯЯ НАВИГАЦИЯ -->
+    <nav class="bottom-nav">
+        <button class="nav-btn active" data-screen="chat">
+            <span class="nav-icon">💬</span>
+            <span class="nav-label">Чат</span>
+        </button>
+        <button class="nav-btn" data-screen="status">
+            <span class="nav-icon">📊</span>
+            <span class="nav-label">Статус</span>
+        </button>
+        <button class="nav-btn" data-screen="settings">
+            <span class="nav-icon">⚙️</span>
+            <span class="nav-label">Настройки</span>
+        </button>
+        <button class="nav-btn" data-screen="about">
+            <span class="nav-icon">ℹ️</span>
+            <span class="nav-label">О нас</span>
+        </button>
+    </nav>
+
+    <script src="app.js"></script>
+</body>
+</html>
